@@ -1,0 +1,330 @@
+---
+title: "Whole microbiome network analysis"
+author: "Bea"
+date: "2023-03-27"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library("phyloseq")
+library("ggplot2")
+library("RColorBrewer")
+library("patchwork")
+library("microbiome")
+library("ape")
+library("vegan")
+#library("decontam")
+library('tidyverse')
+library("ecodist")
+library("viridis")
+library("igraph")
+library("GGally")
+library("intergraph")
+library("network")
+library("SpiecEasi")
+library("ggpubr")
+
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## CURATING THE DATASETS
+
+After calculating the differentially abundant microorganisms present in both the whole microbiome. We need to investigate first where each microorganisms is more abundant: Ouseburn or Nafferton
+
+```{r microbiome}
+# Create a jittered boxplot for each genus, it will be curated later
+
+abudant_taxa_list <- row.names(diff_ab_taxa)
+ab_pseq <- prune_taxa(abudant_taxa_list, scr_pseq)
+ab_pseq <- microbiome::transform(ab_pseq, transform = "compositional")
+ab_pseq_order <- ab_pseq %>% 
+  tax_glom("Genus")
+phyloseq::taxa_names(ab_pseq_order) <- phyloseq::tax_table(ab_pseq_order)[, "Genus"]
+microbial_df <- phyloseq::psmelt(ab_pseq_order) 
+microbial_df %>%
+  ggplot(data = ., aes(x = Farm, y = Abundance)) +
+    geom_boxplot() +
+    geom_jitter(aes(color = OTU), height = 0, width = .2) +
+    labs(x = "", y = "Abundance\n") +
+    facet_wrap(~ OTU, scales = "free", ncol = 5) +
+    theme(legend.position = "none") +
+    scale_color_manual(values = col_vector74)
+```
+Now, we do the same for viruses
+
+```{r virome}
+vabudant_taxa_list <- row.names(vdiff_ab_taxa)
+vab_pseq <- prune_taxa(vabudant_taxa_list, scr_vseq)
+vab_pseq <- microbiome::transform(vab_pseq, transform = "compositional")
+ab_vseq_genus <- vab_pseq %>% 
+  tax_glom("Genus")
+phyloseq::taxa_names(ab_vseq_genus) <- phyloseq::tax_table(ab_vseq_genus)[, "Genus"]
+
+viral_df <- phyloseq::psmelt(ab_vseq_genus) 
+viral_df %>% 
+  ggplot(data = ., aes(x = Farm, y = Abundance)) +
+    geom_boxplot(outlier.shape = NA) +
+    geom_jitter(aes(color = OTU), height = 0, width = .2) +
+    labs(x = "", y = "Abundance\n") +
+    facet_wrap(~ OTU, scales = "free") +
+    theme(legend.position = "none")
+```
+
+## NETWORK ANALYSIS OF MICROBIOME AND VIROME DATA
+
+Now let's curate the network by only using the core microbiome to calculate the edges and nodes
+
+```{r}
+core.names = taxa_names(pseq.core)
+vcore.names = taxa_names(vseq.core)
+pseq.net = prune_taxa(core.names, scr_pseq)
+vseq.net = prune_taxa(vcore.names, scr_vseq)
+```
+
+Now, let's subset to the top 25 most abundant OTU and vOTU to start the network analysis, as we'll use this to curate the final graph (the original will be too large)
+
+```{r}
+top25OTU.names = names(sort(taxa_sums(pseq.net), TRUE)[1:10])
+top25OTU = prune_taxa(top25OTU.names, scr_pseq) 
+
+top25vOTU.names = names(sort(taxa_sums(vseq.net), TRUE)[1:10])
+top25vOTU = prune_taxa(top25vOTU.names, scr_vseq) 
+```
+
+Extract TOP25 OTU/vOTU from original count data first. We'll use this to curate the network in the final steps
+
+```{r}
+microbe_top25 <- prune_taxa(taxa_names(top25OTU), scr_pseq)
+viral_top25 <- prune_taxa(taxa_names(top25vOTU), scr_vseq)
+```
+
+
+# Split datasets by farm
+
+```{r}
+naff_phy <- subset_samples(pseq.net, Farm == "Nafferton")
+ous_phy <- subset_samples(pseq.net, Farm == "Ouseburn")
+
+v_naff_phy <- subset_samples(vseq.net, Farm == "Nafferton")
+v_ous_phy <- subset_samples(vseq.net, Farm == "Ouseburn")
+```
+
+We use absolute counts for SpiecEasi, as the program will automatically transform the data into compositional metrics and normalization.
+
+```{r echo=FALSE}
+#Reorder samples for analysis in spiec easi
+order <- c(colnames(otu_table(naff_phy)))
+otu_table(v_naff_phy) <- otu_table(v_naff_phy)[, order]
+order2 <- c(colnames(otu_table(ous_phy)))
+otu_table(v_ous_phy) <- otu_table(v_ous_phy)[, order2]
+```
+
+```{r echo=FALSE}
+multi.kingdom.naff <- multi.spiec.easi(list(naff_phy, v_naff_phy), method="mb", lambda.min.ratio=1e-2, nlambda=20, pulsar.params=list(rep.num=100))
+multi.kingdom.ous <- multi.spiec.easi(list(ous_phy, v_ous_phy), method="mb", lambda.min.ratio=1e-2, nlambda=20, pulsar.params=list(rep.num=100))
+```
+Let's start with the plots for each of the networks
+
+```{r}
+## Plot the network and colour the nodes by Phylum
+spiec.graph.naff=adj2igraph(getRefit(multi.kingdom.naff), vertex.attr=list(name=c(taxa_names(naff_phy), taxa_names(v_naff_phy))))
+spiec.graph.ous=adj2igraph(getRefit(multi.kingdom.ous), vertex.attr=list(name=c(taxa_names(ous_phy), taxa_names(v_ous_phy))))
+```
+
+## CREATE A SUBNETWORK WITH TOP OTUS AND VOTUs
+
+For the construction of the main networks, we've used the core microbial and viral networks (hundreds of taxa), and we can now curate those networks to show only the top taxa we are interested in, we the advantage that we can also recover the nodes that connect to them, retaining important information.
+
+```{r set_data}
+#Set the data we are going to plot first
+query = multi.kingdom.ous
+mgraph = spiec.graph.ous
+phy = ous_phy
+vphy = v_ous_phy
+
+#Try nafferton with bac+euk
+#query = resultsbaek[1,1][[1]]
+#mgraph = resultsbaek[2,1][[1]]
+#phy = bc_naf
+#vphy = fc_naf
+
+```
+
+
+```{r}
+# make a list of the names of the nodes of interest from top otus
+#rownames(tax_table(microbe_top25)) <- tax_table(microbe_top25)[,c('Genus', "Species")]
+nodes_of_interest <- c(taxa_names(microbe_top25), taxa_names(viral_top25))
+#nodes_of_interest <- c(taxa_names(top_bac_naf), taxa_names(top_euk_naf))
+
+# select the nodes having these names
+selnodes <- V(mgraph)[name %in% nodes_of_interest]
+# get their network neighborhood 
+selegoV <- ego(mgraph, order=1, nodes = selnodes, mode = "all", mindist = 0)
+
+# turn the returned list of igraph.vs objects into a graph
+qgraph <- induced_subgraph(mgraph,unlist(selegoV))
+```
+
+Obtain standard measures from the graph, including network degree and betweenness
+
+```{r net_measures, results='hide'}
+netw = single.graph.naff
+
+# Degree centrality and average degree
+degree.cent <- centr_degree(netw, mode = "all")
+degree.cent$res
+
+mean.degr <- mean(igraph::degree(netw, mode = "all"))
+mean.norm.degr <- mean(igraph::degree(netw, mode = "all", normalized = T))
+
+# Closeness
+closeness.cent <- igraph::closeness(netw, mode="all")
+closeness.cent
+
+# Transitivity or clustering coefficient
+#transitivity.cent <- transitivity(netw, type = "average")
+transitivity.cent <- transitivity(netw, type = "global")
+transitivity.cent
+
+# Modularity
+wtc <-  cluster_walktrap(netw)
+modularity.cent <- modularity(netw, membership(wtc))
+modularity.cent
+
+# Average path length
+pathlength.cent <- mean_distance(netw, directed = FALSE)
+pathlength.cent
+
+# Average normalized betweenness
+between.ces <- igraph::betweenness(netw, directed = T, normalized = T)
+mean.bet <- mean(between.ces)
+```
+
+```{r}
+mean.degr
+mean.norm.degr
+transitivity.cent
+modularity.cent
+pathlength.cent
+mean.bet
+```
+
+
+## PLOT THE NETWORK
+
+```{r plot_set, results='hide'}
+# Visualize using ggnet
+
+# Col vector up to 74 color samples
+col_vector74 = c("#7FC97F","#BEAED4","#FDC086","#FFFF99","#386CB0","#F0027F","#BF5B17","#666666","#1B9E77","#D95F02","#7570B3","#E7298A","#66A61E","#E6AB02","#A6761D","#666666","#A6CEE3","#1F78B4","#B2DF8A","#33A02C","#FB9A99","#E31A1C","#FDBF6F","#FF7F00","#CAB2D6","#6A3D9A","#FFFF99","#B15928","#FBB4AE","#B3CDE3","#CCEBC5","#DECBE4","#FED9A6","#FFFFCC","#E5D8BD","#FDDAEC","#F2F2F2","#B3E2CD","#FDCDAC","#CBD5E8","#F4CAE4","#E6F5C9","#FFF2AE","#F1E2CC","#CCCCCC","#E41A1C","#377EB8","#4DAF4A","#984EA3","#FF7F00","#FFFF33","#A65628","#F781BF","#999999","#66C2A5","#FC8D62","#8DA0CB","#E78AC3","#A6D854","#FFD92F","#E5C494","#B3B3B3","#8DD3C7","#FFFFB3","#BEBADA","#FB8072","#80B1D3","#FDB462","#B3DE69","#FCCDE5","#D9D9D9","#BC80BD","#CCEBC5","#FFED6F")
+
+# Add edged colors based on nodes connected
+
+#The inverse covariance matrix is obtained via a form of regression
+betaMat=as.matrix(symBeta(getOptBeta(query)))
+
+otu.ids <- colnames(query[[1]]$data)
+edges=E(qgraph)
+edge.colors=c()
+edge.weight=c()
+for(e.index in 1:length(edges)){
+  adj.nodes=ends(qgraph,edges[e.index])
+  xindex=which(otu.ids==adj.nodes[1])
+  yindex=which(otu.ids==adj.nodes[2])
+  beta=betaMat[xindex,yindex]
+  if(beta>0){
+    edge.colors=append(edge.colors,"forestgreen")
+    #edge.weight= format(beta*100,digits=3)
+    weight= format(beta*100,digits=3)
+    edge.weight=append(edge.weight,weight)
+    
+    cat("Beta pos:",beta,"\n")
+    
+  }else if(beta<0){
+    edge.colors=append(edge.colors,"red")
+    weight= format(beta*100,digits=3)
+    edge.weight=append(edge.weight,weight)
+    
+    cat("Beta neg:",beta,"\n")
+    
+    
+  }
+}
+
+E(qgraph)$color=edge.colors
+E(qgraph)$weight=edge.weight
+
+#How many nodes connected at specific rank
+nb_nodes <- vcount(qgraph)
+tax_table(phy) <- tax_table(phy)[,"Genus"]
+tax_table(vphy) <- tax_table(vphy)[,'Genus']
+
+#Taxa names for microbes
+otu_ids <- V(qgraph)$name
+idx <- which(row.names(tax_table(phy)) %in% otu_ids)
+taxa <- as.character(tax_table(phy)[,"Genus"])[idx]
+
+#Taxa names for virus
+votu_ids <- V(qgraph)$name
+vidx <- which(row.names(tax_table(vphy)) %in% votu_ids)
+vtaxa <- as.character(tax_table(vphy)[,"Genus"])[vidx]
+
+ig2 <- asNetwork(qgraph)
+network.vertex.names(ig2) <- c(taxa, vtaxa)
+
+net <- ig2
+net %v% "Genus" = as.character(c(taxa, vtaxa))
+y= col_vector74[1:nb_nodes]
+#y=viridis(n = 35, option = "viridis")
+names(y) <- levels(as.factor(c(taxa, vtaxa)))
+```
+
+```{r plots}
+#Plot the network
+
+p_naff <-  ggnet2(net,
+             color = "Genus",
+             palette = y,
+             alpha = 0.75,
+             size = "degree", 
+             #edge.label = NULL, 
+             #edge.size=1,
+             #edge.label = "none",
+             edge.color="color",
+             edge.alpha = 0.5,
+             label = TRUE, 
+             label.size = 3
+             #edge.label.size = 2
+             ) +
+  guides(col="none", size ="none") +
+  #geom_nodelabel_repel(label = network.vertex.names(net)) +
+  ggtitle("Nafferton network")
+  
+
+p_ous <- ggnet2(net,
+            color = "Genus",
+            palette = y,
+            alpha = 0.75,
+            size = "degree", 
+            #edge.label = "weight", 
+            #edge.size=1,
+            edge.color="color",
+            edge.alpha = 0.5,
+            label = TRUE, 
+            label.size = 3
+            #edge.label.size = 2
+            ) +
+  guides(col="none", size = "none") +
+  #geom_text_repel() +
+  ggtitle("Ouseburn network")
+
+
+whole_plot <- ggarrange(p_naff, p_ous, ncol = 2, nrow = 1)
+ggsave(file="whole_net_plot_top10.svg", plot=whole_plot, width=18, height=10)
+```
+
+
+
+
+

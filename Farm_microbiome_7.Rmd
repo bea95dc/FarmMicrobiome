@@ -1,0 +1,284 @@
+---
+title: "Environmental analysis based on sample location"
+author: "Bea"
+date: "2023-08-11"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library("phyloseq")
+library("ggplot2")
+library("RColorBrewer")
+library("patchwork")
+library("microbiome")
+library("ape")
+library("vegan")
+library("tidyverse")
+library("viridis")
+library("grid")
+library("readxl")
+library("eulerr")
+library("microbiomeutilities")
+library("wesanderson")
+library("ggsci")
+library("ggvenn")
+
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## STEP 1. Subset the phyloseq object
+
+We're subsetting the phyloseq object to retain only samples coming from the offices and animal dwellings
+
+```{r subset}
+
+sub_pseq <- subset_samples(scr_pseq, RoomType == "Off" | RoomType == "AD") 
+sub_df <- prune_taxa(taxa_sums(sub_pseq) > 10000, sub_pseq) %>% 
+  tax_glom(taxrank = "Phylum") %>% 
+  #transform_sample_counts(function(x) {x/sum(x)}) %>%
+  psmelt() %>% 
+  arrange(Phylum)
+```
+
+Now create the plots using geom_area
+
+```{r plot}
+off_plot <- sub_df %>% 
+  mutate(Time = as_date(Time)) %>% 
+  mutate(Room_position = replace_na(Room_position, "Single")) %>% 
+  #filter(Room == "OfficeNaff") %>% 
+  group_by(Room, Room_position, Time, Phylum) %>%
+  summarise(n = sum(Abundance)) %>% 
+  mutate(percentage = n / sum(n)) %>% 
+  ggplot(aes(x= Time, y = percentage, fill = Phylum)) +
+  #geom_bar(stat = "identity") +
+  geom_area(alpha=0.6, size=.5, colour="white", position = "stack") +
+  scale_fill_viridis(discrete = TRUE, option = "mako") +
+  #scale_x_discrete(guide = guide_axis(angle = 45)) +
+  #facet_grip(~Room_position, scales = "free_x", space = "free_x") +
+  facet_wrap(Room ~ Room_position, strip.position = "top", scales = "free") +
+  scale_x_date(labels = c("Summer", "Winter", "Spring")) +
+  theme(strip.text.x = element_text(size=10)) +
+  guides(fill=guide_legend(title = "Taxa", ncol = 3)) +
+  ggtitle("Microbial diversity changes by room location")
+
+```
+
+Now onto another graph. We need to plot the average humidity and temperatures at each farm. That info is stored in two different sheets in the same excel file
+
+```{r weather}
+
+weather_ous <- read_xlsx("./weather_history.xlsx", sheet = "Newcastle", col_names = TRUE) %>% 
+  mutate(Date = as.Date(Var, format = "%Y/%m/%d")) %>% 
+  select(-Var)
+weather_naf <- read_xlsx("./weather_history.xlsx", sheet = "Stocksfield", col_names = TRUE) %>% 
+  mutate(Date = as.Date(Var, format = "%Y/%m/%d")) %>% 
+  select(-Var)
+
+```
+
+
+Plot with combined temperature (as line) and humidity (as bars).
+
+```{r loc_plot}
+naf_plot1 <- ggplot(weather_naf, aes(Date)) +
+  geom_ribbon(aes(ymin = `Low Temp`, ymax= `High Temp`), fill = "lightcyan2") +
+  geom_line(aes(y = `Av. Temp`), colour = "lightseagreen") +
+  geom_line(aes(y = `High Temp`), colour = "red") +
+  geom_line(aes(y = `Low Temp`), colour = "blue") + 
+  scale_x_date(date_breaks = "1 month",  date_labels = "%m/%Y") +
+  theme_minimal() +
+  theme(axis.title.x = element_blank(), axis.text.x = element_blank())
+
+naf_plot2 <- ggplot(weather_naf, aes(Date)) +
+  geom_bar(aes(y = `Av. Hum`), fill = "lightskyblue1", stat = "identity") +
+  geom_line(aes(y = `High Hum`), colour = "mediumorchid3") +
+  geom_line(aes(y = `Low Hum`), colour = "mediumturquoise") + 
+  scale_x_date(date_breaks = "1 month", date_labels = "%m/%Y") +
+  theme_minimal() +
+  theme(axis.title.x = element_blank(),axis.text.x = element_text(angle=45))
+
+```
+
+```{r plot_naf}
+grid.newpage()
+grid.draw(rbind(ggplotGrob(naf_plot1), ggplotGrob(naf_plot2), size = "last"))
+```
+
+### VENN DIAGRAMS PER TYPE OF ROOM AND FARM ###
+
+To compare the microbial features shared by the different offices and animal dwellings, let's create a Venn diagram.
+
+```{r}
+table(meta(sub_pseq)$Room, useNA = "always")
+sub.pseqrel <- microbiome::transform(sub_pseq, "compositional")
+room_list <- unique(as.character(meta(sub.pseqrel)$Room))
+```
+```{r}
+## Find the core microorganisms in each room, independently of location inside room and time of colection
+
+list_core <- c()
+
+for (n in room_list) {
+  ps.sub <-  subset_samples(sub.pseqrel, Room == n)
+  core_m <- core_members(ps.sub,
+                         detection = 0.001,
+                         prevalence = 0.90) # 1 % in at least 90% samples
+  print(paste0("No. of core taxa in ", n, " : ", length(core_m)))
+  list_core[[n]] <- core_m
+}
+```
+```{r}
+print(list_core)
+```
+```{r}
+#Specify colours for the venn diagram
+
+mycols <- c(Cafe = "lightblue", OfficeOus = "lightcoral", OfficeNaff = "lightgoldenrod", CafeEntrance = "seashell2")
+plot(venn(list_core[c("OfficeOus", "OfficeNaff", "Cafe", "CafeEntrance")]),
+     fills = mycols)
+
+ggvenn(list_core[c("OfficeOus", "OfficeNaff", "Cafe", "CafeEntrance")], fill_color = c("lightblue", "lightcoral", "lightgoldenrod",  "seashell2"), stroke_size = 0, set_name_size = 7, show_percentage = FALSE, text_size = 7)
+```
+
+```{r}
+mycols <- c(PigDwell = "lightpink", CowShed = "lightseagreen", MilkingBld = "darkseagreen", CalfShed = "deeppink3")
+plot(venn(list_core[c("PigDwell", "CowShed", "CalfShed", "MilkingBld")]), fills = mycols)
+
+ggvenn(list_core[c("PigDwell", "CowShed", "CalfShed", "MilkingBld")], fill_color = c("lightpink", "lightseagreen", "darkseagreen",  "deeppink3"), stroke_size = 0, set_name_size = 7, show_percentage = FALSE, text_size = 7)
+```
+Find the common microorganisms between samples in different locations of the same room
+
+```{r}
+otufun <- function(room, dis) {
+  listy <-  list()
+  #r <-  substitute(room)
+  #p <-  substitute(dis)
+  ps.sub <- subset_samples(sub.pseqrel, Room == room & Room_position == dis)
+  #core_m <- core_members(ps.sub, detection = 0.001, prevalence = 0.90)
+  #print(paste0("No. of core taxa in ", r, " : ", length(core_m)))
+  #listy[[substitute(dis)]] <- core_m
+  #return(listy)
+  ps.sub
+}
+```
+
+```{r}
+Cafe_list <- list()
+Cafe_list$Right <- subset_samples(sub.pseqrel, Room == "Cafe" & Room_position == "Right") %>% 
+  core_members(detection = 0.001, prevalence = 0.9)
+Cafe_list$Left <- subset_samples(sub.pseqrel, Room == "Cafe" & Room_position == "Left") %>% 
+  core_members(detection = 0.001, prevalence = 0.9)
+Cafe_list$Middle <- subset_samples(sub.pseqrel, Room == "Cafe" & Room_position == "Middle") %>% 
+  core_members(detection = 0.001, prevalence = 0.9)
+OfficeOus <- list()
+OfficeOus$Right <- subset_samples(sub.pseqrel, Room == "OfficeOus" & Room_position == "Right") %>% 
+  core_members(detection = 0.001, prevalence = 0.9)
+OfficeOus$Left <- subset_samples(sub.pseqrel, Room == "OfficeOus" & Room_position == "Left") %>% 
+  core_members(detection = 0.001, prevalence = 0.9)
+OfficeNaff <- list()
+OfficeNaff$Right <- subset_samples(sub.pseqrel, Room == "OfficeNaff" & Room_position == "Right") %>% 
+  core_members(detection = 0.001, prevalence = 0.9)
+OfficeNaff$Left <- subset_samples(sub.pseqrel, Room == "OfficeNaff" & Room_position == "Left") %>% 
+  core_members(detection = 0.001, prevalence = 0.9)
+```
+
+```{r}
+ggvenn(Cafe_list, fill_color = c("#009E73", "#E69F00", "#56B4E9"), stroke_size = 0, set_name_size = 7, show_percentage = FALSE) +
+  ggtitle("Venn diagram of samples from Cafe at Ouseburn")
+```
+```{r}
+ggvenn(OfficeNaff, fill_color = c("#009E73", "#E69F00"), stroke_size = 0, set_name_size = 7, show_percentage = FALSE, text_size = 8) +
+  ggtitle("Venn diagram of samples from Office at Nafferton")
+```
+```{r}
+ggvenn(OfficeOus, fill_color = c("hotpink2", "paleturquoise"), stroke_size = 0, set_name_size = 7, show_percentage = FALSE, text_size = 8) +
+  ggtitle("Venn diagram of samples from Office at Ouseburn") 
+```
+Find the Venn diagram intersection and match the OTU names to their taxonomy in the dataset
+
+```{r intersec}
+## Get the list of OTUs in the intersection
+inter_offs <- as.list(Reduce(intersect, list_core[c("OfficeOus", "OfficeNaff", "Cafe", "CafeEntrance")]))
+inter_anim <- as.list(Reduce(intersect, list_core[c("PigDwell", "CowShed", "CalfShed", "MilkingBld")]))
+inter_offnaf <- as.list(Reduce(intersect, OfficeNaff))
+inter_offous <- as.list(Reduce(intersect, OfficeOus))
+inter_caf <- as.list(Reduce(intersect, Cafe_list))
+```
+
+```{r get_taxa_df}
+df_offs <-  subset_taxa(scr_pseq, rownames(otu_table(scr_pseq)) %in% inter_offs) %>% 
+    tax_table() %>% 
+    as.data.frame()
+
+df_anim <-  subset_taxa(scr_pseq, rownames(otu_table(scr_pseq)) %in% inter_anim) %>% 
+    tax_table() %>% 
+    as.data.frame()
+
+df_offnaf <-  subset_taxa(scr_pseq, rownames(otu_table(scr_pseq)) %in% inter_offnaf) %>% 
+    tax_table() %>% 
+    as.data.frame()
+
+df_offous <-  subset_taxa(scr_pseq, rownames(otu_table(scr_pseq)) %in% inter_offous) %>% 
+    tax_table() %>% 
+    as.data.frame()
+
+df_caf <-  subset_taxa(scr_pseq, rownames(otu_table(scr_pseq)) %in% inter_caf) %>% 
+    tax_table() %>% 
+    as.data.frame()
+```
+
+Find the distinctive OTUs in each room (those OTUs that are not shared)
+
+```{r non-shared}
+## Extract OTU names
+a <- list_core[c("OfficeOus", "OfficeNaff", "Cafe", "CafeEntrance")]
+offs_un <- lapply(1:length(a), function(n) setdiff(a[[n]], unlist(a[-n])))
+
+b <- list_core[c("PigDwell", "CowShed", "CalfShed", "MilkingBld")]
+anim_un <- lapply(1:length(b), function(n) setdiff(b[[n]], unlist(b[-n])))
+
+## Produce dfs with the full taxonomic names
+
+df_offnaff_un <- subset_taxa(scr_pseq, rownames(otu_table(scr_pseq)) %in% offs_un[[2]]) %>% 
+    tax_table() %>% 
+    as.data.frame()
+df_cafe_un <- subset_taxa(scr_pseq, rownames(otu_table(scr_pseq)) %in% offs_un[[3]]) %>% 
+    tax_table() %>% 
+    as.data.frame()
+df_calf_un <- subset_taxa(scr_pseq, rownames(otu_table(scr_pseq)) %in% anim_un[[3]]) %>% 
+    tax_table() %>% 
+    as.data.frame()
+df_cow_un <- subset_taxa(scr_pseq, rownames(otu_table(scr_pseq)) %in% anim_un[[2]]) %>% 
+    tax_table() %>% 
+    as.data.frame()
+df_pig_un <- subset_taxa(scr_pseq, rownames(otu_table(scr_pseq)) %in% anim_un[[1]]) %>% 
+    tax_table() %>% 
+    as.data.frame()
+df_cafent_un <- subset_taxa(scr_pseq, rownames(otu_table(scr_pseq)) %in% offs_un[[4]]) %>% 
+    tax_table() %>% 
+    as.data.frame()
+df_milk_un <- subset_taxa(scr_pseq, rownames(otu_table(scr_pseq)) %in% anim_un[[4]]) %>% 
+    tax_table() %>% 
+    as.data.frame()
+
+```
+
+```{r}
+offnaf_un <- lapply(1:length(OfficeNaff), function(n) setdiff(OfficeNaff[[n]], unlist(OfficeNaff[-n])))
+offous_un <- lapply(1:length(OfficeOus), function(n) setdiff(OfficeOus[[n]], unlist(OfficeOus[-n])))
+
+df_offous_r <- subset_taxa(scr_pseq, rownames(otu_table(scr_pseq)) %in% offous_un[[1]]) %>% 
+    tax_table() %>% 
+    as.data.frame()
+df_offous_l <- subset_taxa(scr_pseq, rownames(otu_table(scr_pseq)) %in% offous_un[[2]]) %>% 
+    tax_table() %>% 
+    as.data.frame()
+df_offnaf_r <- subset_taxa(scr_pseq, rownames(otu_table(scr_pseq)) %in% offnaf_un[[1]]) %>% 
+    tax_table() %>% 
+    as.data.frame()
+df_offnaf_l <- subset_taxa(scr_pseq, rownames(otu_table(scr_pseq)) %in% offnaf_un[[2]]) %>% 
+    tax_table() %>% 
+    as.data.frame()
+```
+

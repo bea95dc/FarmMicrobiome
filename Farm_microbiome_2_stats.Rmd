@@ -1,0 +1,487 @@
+---
+title: "Statistical analysis of Farm microbiome data"
+author: "Bea"
+date: "2023-03-23"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+#Load packages
+library("phyloseq")
+library("ggplot2")
+library("RColorBrewer")
+library("patchwork")
+library("microbiome")
+library("ape")
+library("vegan")
+#library("decontam")
+library('tidyverse')
+library("ecodist")
+library("ALDEx2")
+library('ggplot2')
+library('ggrepel')
+library("ANCOMBC")
+library("DESeq2")
+#library("ampvis2")
+
+#Set working directory
+setwd("/Users/beatrizdelgadocorrales/Desktop/PhD-BE_Microbiome/")
+
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## INTRO TO STATISTICAL ANALYSIS OF MICROBIOME DATA
+
+For this analysis we'll need some of the objects we created in the initial analysis of the microbiome data for the Beta-diversity analyses.
+
+1. CLR-transformed phyloseq object (ps_clr)
+2. Distance calculations (clr_dist_matrix)
+3. Betadispersion (dispr)
+
+However, some of the programs used here will take care of all that and use raw counts.
+
+# Anova outlook
+
+First, let's see how the ANOVA test looks like in our data, based on the "Farm" factor
+
+```{r anova}
+anova(dispr_farm)
+```
+We can see that the results are not ideal, and this is because ANOVA's statistical power for microbiome data is not enough. This is why we're going to use permANOVA tests to calculate the statistical relevance of our factors in the microbiome composition
+
+## permANOVA tests on different factors
+
+Let's try the Adonis2 function from the vegan package to do the test.
+
+```{r permanova}
+permanova <- vegan::adonis2(clr_dist_matrix~phyloseq::sample_data(ps_clr)$RoomType*phyloseq::sample_data(ps_clr)$Farm*phyloseq::sample_data(ps_clr)$Season, perm=999, method = "euclidean") 
+permanova
+```
+
+Now, let's print the results
+
+```{r}
+permanova <- as.data.frame(permanova)
+write.csv(permanova, "./permanova.csv", row.names=TRUE)
+```
+
+## DIFFERENTIAL ABUNDANCE ANALYSIS
+
+After checking which factors are relevant and impact microbiome composition in our samples, let's checks which microorganisms are significantly different between the two farms (this can be done with other factor but let's start at this level)
+For this test, we'll combine three different methods: ALDEx2, ANCOM-II, DESeq2, as there is no gold standard method for DA in microbiome data, so a combination of OTUs detected by the three methods will be chosen.
+
+#ALDEx2
+Let's try ALDEx2 first:
+
+```{r aldex2, echo=FALSE}
+aldex2_da <- ALDEx2::aldex(data.frame(phyloseq::otu_table(scr_pseq)), phyloseq::sample_data(scr_pseq)$Farm, test="t", effect = TRUE, denom="iqlr")
+```
+
+Now, let's plot the results to visualize the amount of OTUs that can be considered differential abundant.
+
+```{r }
+# Plot effect sizes
+
+ALDEx2::aldex.plot(aldex2_da, type="MW", test="wilcox", called.cex = 1, cutoff = 0.05)
+ALDEx2::aldex.plot(aldex2_da, type="MA", test="welch", xlab="Log-ratio abundance", ylab="Difference")
+ALDEx2::aldex.plot(aldex2_da, type="MW", test="welch", xlab="Dispersion", ylab="Difference")
+
+```
+
+Now, filter results by BH FDR values (leaving only significant results) and by Effect Size, to discriminate actually relevant OTUs
+
+```{r}
+#Clean up presentation
+
+taxa_info <- data.frame(tax_table(scr_pseq))
+taxa_info <- taxa_info %>% 
+  rownames_to_column(var = "OTU")
+
+sig_aldex2 <- aldex2_da %>%
+  rownames_to_column(var = "OTU") %>%
+  filter(wi.eBH < 0.05) %>% # Filter by BH FDR value
+  filter(effect > abs(0.8)) %>% # Filter by ES pos. or neg. 
+  arrange(effect, wi.eBH) %>%
+  dplyr::select(OTU, diff.btw, diff.win, effect, wi.ep, wi.eBH)
+sig_aldex2 <- left_join(sig_aldex2, taxa_info)
+
+```
+
+Again, plot the refined results to discriminate between OTUs founds as DA using both statistical methods used by ALDEx2. 
+
+```{r}
+# identify which values are significant in both the t-test and glm tests
+found.by.all <- which(aldex2_da$we.eBH < 0.05 & aldex2_da$wi.eBH < 0.05)
+
+# identify which values are significant in fewer than all tests
+found.by.one <- which(aldex2_da$we.eBH < 0.05 | aldex2_da$wi.eBH < 0.05)
+
+# plot the within and between variation of the data
+plot(aldex2_da$diff.win, aldex2_da$diff.btw, pch=19, cex=0.3, col=rgb(0,0,0,0.3),
+     xlab="Dispersion", ylab="Difference")
+points(aldex2_da$diff.win[found.by.one], aldex2_da$diff.btw[found.by.one], pch=19,
+       cex=0.7, col=rgb(0,0,1,0.5))
+points(aldex2_da$diff.win[found.by.all], aldex2_da$diff.btw[found.by.all], pch=19,
+       cex=0.7, col=rgb(1,0,0,1))
+abline(0,1,lty=2)
+abline(0,-1,lty=2)
+
+```
+Finally, create a volcano plot for publication purposes, in case that the other plots are not informative enough
+
+```{r}
+## Create a volcano plot where the significant OTUs are highlighted
+
+aldex2_da %>% 
+  rownames_to_column(var = "OTU") %>% 
+  left_join(taxa_info) %>% 
+  mutate(Significant=if_else(we.eBH<0.05, TRUE, FALSE)) %>% #Sort only significant (<0.05) OTUs
+  mutate(OTU=as.character(OTU)) %>% 
+  mutate(TaxonToPrint=if_else(we.eBH<0.05, OTU, "")) %>% # Sort only significant (<0.05) OTU
+  ggplot(aes(x=diff.btw, y=-log10(we.ep), color=Significant, label=TaxonToPrint)) +
+  geom_text_repel(size=1, nudge_y=0.05) +
+  geom_point(alpha=0.6, shape=16) +
+  xlab("log2(fold change)") +
+  ylab("-log10(P-value)") +
+  theme(legend.position="none") +
+  scale_color_manual(values=c("black","red"))
+
+ggsave("volcano.pdf", height=3, width=3, device="pdf") #save file
+```
+
+
+Now let's try ANCOM-II, which can work straight with phyloseq data. We are setting the adjust method to BH so it is comparable to the output from ALDEx2
+
+```{r ancom}
+ancom_da <- ancombc2(data = scr_pseq, fix_formula = "Farm", p_adj_method = 'BH', group = "Farm", pseudo = 1, struc_zero = TRUE, neg_lb = TRUE)
+```
+We need to inspect the output from ANCOM more:
+
+```{r}
+# Obtain the results table from ANCOM output
+ancom_res <- ancom_da$res
+```
+
+Next, let's run DESeq2, a tool that was initially created for RNA-seq data, but that can be also used for DA studies on microbiome abundances.
+
+```{r deseq}
+# Convert to deseq object
+deseq <- phyloseq_to_deseq2(scr_pseq, ~ Farm)
+
+# Run the test
+deseq_da <- DESeq(deseq, test="Wald")
+
+#Extract the results
+
+deseq_res <- as.data.frame(results(deseq_da, cooksCutoff = FALSE))
+deseq_res <- deseq_res %>% 
+  rownames_to_column(var = "OTU")
+deseq_res <- left_join(deseq_res, taxa_info) %>% 
+  arrange(padj)
+
+```
+Now, we need to organise the data by their log2FoldChange to select those OTUs that are DA. L2FC is the equivalent of effect size, and it should be applied as the second filter after using the adjusted p value for sorting the data
+
+```{r}
+sig_deseq <- deseq_res %>% 
+  filter(padj < 0.05)
+```
+
+## COMPARISON OF METHODS
+
+First, compare the number of adjusted p-values under 0.05. This measure described the amoung of OTUs described as statistically relevant
+
+```{r}
+# Measure the p adj for all the oTUs and compare with the total
+
+print(paste0("ALDEx2 test p-values under 0.05: ", sum(aldex2_da$wi.eBH<0.05, na.rm = TRUE), "/", length(aldex2_da$wi.eBH)))
+print(paste0("ANCOM p-values under 0.05: ", sum(ancom_res$diff_FarmOuseburn), "/", length(ancom_res$diff_FarmOuseburn)))
+print(paste0("DESeq2 p-values under 0.05: ", sum(deseq_res$padj<0.05, na.rm = TRUE), "/", length(deseq_res$padj)))
+
+```
+
+Now we have to combine the results and create a measurement of how consistent the predictions are. We will retain OTUs that are found in at least 2 of the methods.
+
+```{r echo=FALSE}
+# Create a taxonomy table for each tool with significant taxa
+# For Deseq2
+
+deseq2_taxa <- filter(deseq_res, padj <= 0.05) %>% 
+  .$OTU
+ancom_taxa <- filter(ancom_res, diff_FarmOuseburn) %>% 
+  .$taxon
+aldex2_taxa <- filter(aldex2_da, we.eBH <= 0.05) %>% 
+  row.names(.)
+```
+
+```{r}
+intersec_taxa <- Reduce(intersect, list(deseq2_taxa, ancom_taxa, aldex2_taxa))
+intersec_taxa
+```
+Then intersection list approach is quite conservative (only 96 taxa), but might give very relevant results. It's also an important step because we already know that DESEq2 tends to give false positives, and we need to get rid of most of its output. Let's have a look at the most relevant taxa:
+
+```{r}
+diff_ab_taxa <- deseq_res[deseq_res$OTU %in% intersec_taxa, c("Kingdom","Order", "Genus", 'Species')]
+```
+
+Let's try a less conservative approach for the selection of DA taxa. We'll compare the significant OTUs and count how many times they are detected by the tools, picking the OTUs that have been detected by at least 2 methods.
+
+```{r}
+# change genus names to otu ids for ancombc results to make it joinable with others
+abc_res <- ancom_res %>% 
+  dplyr::select(taxon, ancombc = diff_FarmOuseburn)
+  
+# join all results together
+summ <- full_join(
+    rownames_to_column(aldex2_da, "taxon") %>%
+      dplyr::select(taxon, aldex2 = wi.eBH),
+    abc_res,
+    by = "taxon") %>%
+  full_join(
+    dplyr::select(deseq_res, taxon = OTU, deseq2 = padj), 
+    by = "taxon") %>%
+  mutate(
+    across(c(aldex2, deseq2), ~ .x <= 0.05),
+    # the following line would be necessary without prevalence filtering 
+    # as some methods output NA
+    across(-taxon, function(x) ifelse(is.na(x), FALSE, x)),
+    ancombc = ifelse(is.na(ancombc), FALSE, ancombc),
+    score = rowSums(across(c(aldex2, ancombc, deseq2))),
+  )
+
+head(summ)
+```
+```{r}
+summarise(summ, across(where(is.logical), sum))
+```
+
+```{r}
+#Filter by OTUs found in all the methods
+
+final_da_taxa <- filter(summ, score >= 3) %>% 
+  .$taxon
+
+```
+
+In this case, we obtain more than 150 taxa that are differential abundant. Now, we just need to know the taxonomic classification of those OTUs.
+
+```{r}
+diff_ab_taxa <- data.frame(tax_table(scr_pseq)[row.names(tax_table(scr_pseq)) %in% final_da_taxa, c("Kingdom","Order", "Genus", 'Species')])
+```
+
+To show these DA results in a poster/paper, let's plot how many OTUs were detected by each 3 of the methods first using a volcano plot
+
+```{r}
+# Rename OTU columns
+aldex2_da <- aldex2_da %>% 
+  rownames_to_column(var = "OTU")
+ancom_res <-  ancom_res %>% 
+  dplyr::rename(., OTU = taxon)
+
+da_res_list <- list(aldex2_da, ancom_res, deseq_res)
+
+# Do a full join of the dataframes
+
+combined_da_res <- da_res_list %>% 
+  purrr::reduce(full_join, by="OTU") %>% 
+  dplyr::select(c(OTU, wi.eBH, diff_FarmOuseburn, padj))
+```
+
+Once we have the final data frame with the combined results, let's set the colors for the plot
+
+```{r}
+# Set color for the points of the volcano plot
+
+# identify which values are significant in both the t-test and glm tests
+found.by.all <- which(combined_da_res$wi.eBH < 0.05 & combined_da_res$padj < 0.05 & combined_da_res$diff_FarmOuseburn == TRUE)
+
+# identify which values are significant in fewer than all tests
+found.by.two <- which((combined_da_res$wi.eBH < 0.05 & combined_da_res$padj < 0.05 | combined_da_res$diff_FarmOuseburn == TRUE) | (combined_da_res$wi.eBH < 0.05 | combined_da_res$padj < 0.05 & combined_da_res$diff_FarmOuseburn == TRUE))
+
+# identify values detected by at least 1 of the tools
+found.by.one <- which(combined_da_res$wi.eBH < 0.05 | combined_da_res$padj < 0.05 | combined_da_res$diff_FarmOuseburn == TRUE)
+
+# plot the within and between variation of the data
+#svg(filename = "da_comparison.svg")
+plot(aldex2_da$diff.win, aldex2_da$diff.btw, pch=19, cex=0.3, col=rgb(0,0,0,0.3),
+     xlab="Dispersion", ylab="Difference") +
+  points(aldex2_da$diff.win[found.by.one], aldex2_da$diff.btw[found.by.one], pch=19,
+       cex=0.7, col="#B3CDE3") +
+  points(aldex2_da$diff.win[found.by.two], aldex2_da$diff.btw[found.by.two], pch=19,
+       cex=0.7, col="pink") +
+  points(aldex2_da$diff.win[found.by.all], aldex2_da$diff.btw[found.by.all], pch=19,
+       cex=0.7, col="#F0027F") +
+  abline(0,1,lty=2) +
+  abline(0,-1,lty=2)
+```
+```{r}
+ggsave("da_comparison.svg", plot = da_comparison_plot, width = 10, height = 6)
+```
+
+
+```{r}
+#Subset aldex results by selecting only the OTUs that were detected by all the tools
+# Rename the OTUs based on their taxonomy
+
+aldex_plot <- aldex2_da[found.by.all, ] %>% 
+  `row.names<-`(., NULL)
+
+final_da_taxa <- aldex_plot$OTU
+
+da_top_taxa <- data.frame(tax_table(scr_pseq)[row.names(tax_table(scr_pseq)) %in% final_da_taxa, c("Kingdom","Order", "Genus", 'Species')]) %>% 
+  tibble::rownames_to_column(., "OTU")
+
+aldex_plot <- left_join(aldex_plot, da_top_taxa, by = "OTU") %>% 
+  unite(Full_species, c(Genus, Species), sep = " ", remove = FALSE)
+
+diff_plot <- aldex_plot %>% 
+  ggplot(aes(x=diff.btw, y=Full_species, fill = diff.btw)) +
+  geom_col() +
+  scale_fill_viridis_c(option = "turbo", name = "Differential\nBetweenness") +
+  labs(x="Betweenness", y="Species") +
+  theme(axis.text.y = element_text(size=12),
+        axis.title.y = element_text(size=15),
+        axis.title.x = element_text(size=15))
+diff_plot
+```
+
+
+```{r}
+ggsave("da_abundance.svg", plot = diff_plot, width = 12, height = 8, bg = "transparent")
+```
+
+## STATISTICAL TESTING AT THE GENUS LEVEL
+
+```{r}
+# Transform phyloseq object to the genus level
+scr_genus <- tax_glom(scr_pseq, taxrank = "Genus")
+
+# Perform ALDEx2 analysis
+aldex2_da_genus <- ALDEx2::aldex(data.frame(phyloseq::otu_table(scr_genus)), phyloseq::sample_data(scr_genus)$Farm, test="t", effect = TRUE, denom="iqlr")
+
+ALDEx2::aldex.plot(aldex2_da_genus, type="MW", test="wilcox", called.cex = 1, cutoff = 0.05)
+```
+```{r}
+#Clean up presentation
+
+taxa_info_genus <- data.frame(tax_table(scr_genus))
+taxa_info_genus <- taxa_info_genus %>% 
+  rownames_to_column(var = "OTU") %>% 
+  dplyr::select(!"Species")
+
+sig_aldex2_genus <- aldex2_da_genus %>%
+  rownames_to_column(var = "OTU") %>%
+  filter(wi.eBH < 0.05) %>% # Filter by BH FDR value
+  #filter(effect > abs(0.8)) %>% # Filter by ES pos. or neg. 
+  arrange(effect, wi.eBH) %>%
+  dplyr::select(OTU, diff.btw, diff.win, effect, wi.ep, wi.eBH)
+sig_aldex2_genus <- left_join(sig_aldex2_genus, taxa_info_genus)
+
+```
+
+**NOTE**: this is the last step done with the updated clean-up
+
+```{r}
+ancom_da_genus <- ancombc2(data = scr_genus, fix_formula = "Farm", p_adj_method = 'BH', group = "Farm", pseudo = 1, struc_zero = TRUE, neg_lb = TRUE)
+```
+```{r}
+# Obtain the results table from ANCOM output
+ancom_res_genus <- ancom_da_genus$res
+```
+
+Next, let's run DESeq2, a tool that was initially created for RNA-seq data, but that can be also used for DA studies on microbiome abundances.
+
+```{r deseq}
+# Convert to deseq object
+deseq_genus <- phyloseq_to_deseq2(scr_genus, ~ Farm)
+
+# Run the test
+deseq_da_genus <- DESeq(deseq_genus, test="Wald")
+
+#Extract the results
+
+deseq_res_genus <- as.data.frame(results(deseq_da_genus, cooksCutoff = FALSE))
+deseq_res_genus <- deseq_res_genus %>% 
+  rownames_to_column(var = "OTU")
+deseq_res_genus <- left_join(deseq_res_genus, taxa_info) %>% 
+  arrange(padj)
+
+```
+```{r}
+sig_deseq_genus <- deseq_res_genus %>% 
+  filter(padj < 0.05)
+```
+
+## COMPARISON OF METHODS
+
+First, compare the number of adjusted p-values under 0.05. This measure described the amoung of OTUs described as statistically relevant
+
+```{r}
+# Measure the p adj for all the oTUs and compare with the total
+
+print(paste0("ALDEx2 test p-values under 0.05: ", sum(aldex2_da_genus$wi.eBH<0.05, na.rm = TRUE), "/", length(aldex2_da_genus$wi.eBH)))
+print(paste0("ANCOM p-values under 0.05: ", sum(ancom_res_genus$diff_FarmOuseburn), "/", length(ancom_res_genus$diff_FarmOuseburn)))
+print(paste0("DESeq2 p-values under 0.05: ", sum(deseq_res_genus$padj<0.05, na.rm = TRUE), "/", length(deseq_res_genus$padj)))
+```
+
+```{r echo=FALSE}
+# Create a taxonomy table for each tool with significant taxa
+# For Deseq2
+
+deseq2_taxa_genus <- filter(deseq_res_genus, padj <= 0.05) %>% 
+  .$OTU
+ancom_taxa_genus <- filter(ancom_res_genus, diff_FarmOuseburn) %>% 
+  .$taxon
+aldex2_taxa_genus <- filter(aldex2_da_genus, we.eBH <= 0.05) %>% 
+  row.names(.)
+```
+
+```{r}
+intersec_taxa_genus <- Reduce(intersect, list(deseq2_taxa_genus, ancom_taxa_genus, aldex2_taxa_genus))
+intersec_taxa_genus
+```
+
+
+```{r}
+diff_ab_taxa_genus <- deseq_res[deseq_res_genus$OTU %in% intersec_taxa_genus, c("Kingdom","Order", "Genus", 'Species')]
+```
+
+Let's try a less conservative approach for the selection of DA taxa. We'll compare the significant OTUs and count how many times they are detected by the tools, picking the OTUs that have been detected by at least 2 methods.
+
+```{r}
+# change genus names to otu ids for ancombc results to make it joinable with others
+abc_res_genus <- ancom_res_genus %>% 
+  dplyr::select(taxon, ancombc = diff_FarmOuseburn)
+  
+# join all results together
+summ_genus <- full_join(
+    rownames_to_column(aldex2_da_genus, "taxon") %>%
+      dplyr::select(taxon, aldex2 = wi.eBH),
+    abc_res_genus,
+    by = "taxon") %>%
+  full_join(
+    dplyr::select(deseq_res_genus, taxon = OTU, deseq2 = padj), 
+    by = "taxon") %>%
+  mutate(
+    across(c(aldex2, deseq2), ~ .x <= 0.05),
+    # the following line would be necessary without prevalence filtering 
+    # as some methods output NA
+    across(-taxon, function(x) ifelse(is.na(x), FALSE, x)),
+    ancombc = ifelse(is.na(ancombc), FALSE, ancombc),
+    score = rowSums(across(c(aldex2, ancombc, deseq2))),
+  )
+
+head(summ_genus)
+```
+```{r}
+summarise(summ_genus, across(where(is.logical), sum))
+```
+
+```{r}
+#Filter by OTUs found in all the methods
+
+final_da_taxa_genus <- filter(summ_genus, score >= 2) %>% 
+  .$taxon
+diff_ab_taxa_genus <- data.frame(tax_table(scr_genus)[row.names(tax_table(scr_genus)) %in% final_da_taxa_genus, c("Kingdom","Order", "Genus")])
+```
+

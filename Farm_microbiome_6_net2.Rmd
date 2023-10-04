@@ -1,0 +1,712 @@
+---
+title: "Farm network by kingdom"
+author: "Bea"
+date: "2023-05-09"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library("phyloseq")
+library("ggplot2")
+library("RColorBrewer")
+library("patchwork")
+library("microbiome")
+library("ape")
+library("vegan")
+#library("decontam")
+library('tidyverse')
+library("ecodist")
+library("viridis")
+library("igraph")
+library("GGally")
+library("sna")
+library("intergraph")
+library("network")
+library("SpiecEasi")
+library("ggpubr")
+library("gridExtra")
+library("grid")
+
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Divide core microbiome by kingdom
+
+We are doing this to observe how the network changes the more layers you add to it. We have already created these objects with the raw counts in other Rmd files. Now it's time to calculate the core microbiomes in each of those objects. We also need to separate by farm.
+
+```{r divide}
+## Function for sub-sampling the phyloseq objects. Creates a list with the phyloseq objects for Naff and Ouseburn separately
+net_ps <- function(phylo) {
+  naf <- subset_samples(phylo, Farm == "Nafferton")
+  ous <- subset_samples(phylo, Farm == "Ouseburn")
+  #relnaf <- microbiome::transform(naf, "compositional")
+  #relous <- microbiome::transform(ous, "compositional")
+  #cornaf <- core(relnaf, detection = 1/100, prevalence = 25/100)
+  #corous <- core(relous, detection = 1/100, prevalence = 25/100)
+  namesnaf <-  names(sort(taxa_sums(naf), TRUE)[1:100])
+  namesous <- names(sort(taxa_sums(ous), TRUE)[1:100])
+  pnaf <-  prune_taxa(namesnaf, naf)
+  pous <- prune_taxa(namesous, ous)
+  plist <- list(pnaf, pous)
+  return(plist)
+}
+
+# Function to store the desired phyloseq object from the list obtained from net_ps()
+psob_fun <- function(phylolist, numb) {
+  obj <- phylolist[[numb]]
+  return(obj)
+}
+```
+
+Obtain the corresponding core microbiome phyloseq objects by farm and kingdom.
+
+```{r}
+#Archaea
+acore_list <- net_ps(a_pseq) #List of phyloseq objects
+ac_naf <- psob_fun(acore_list, 1) #Phyloseq for Nafferton
+ac_ous <- psob_fun(acore_list, 2) #Phyloseq for Ouseburn
+#Bacteria
+bcore_list <- net_ps(b_pseq)
+bc_naf <- psob_fun(bcore_list, 1)
+bc_ous <- psob_fun(bcore_list, 2)
+#Eukaryotes
+fcore_list <- net_ps(f_pseq)
+fc_naf <- psob_fun(fcore_list, 1)
+fc_ous <- psob_fun(fcore_list, 2)
+#Viruses
+# For viruses we need to reorder
+sam_order <- sample_names(b_pseq)
+otu_table(scr_vseq) <- otu_table(scr_vseq)[,sam_order]
+vcore_list <- net_ps(scr_vseq)
+vc_naf <- psob_fun(vcore_list, 1)
+vc_ous <- psob_fun(vcore_list, 2)
+```
+
+Now let's create the functions that will allow us to calculate the networks and the graphs
+
+```{r}
+# Function to calculate the network correlations and the graph using both SPIEC-EASI and igraph
+net_fun <- function(phylo) {
+  net <- spiec.easi(phylo, method="mb", lambda.min.ratio=1e-2, nlambda=20, pulsar.params=list(rep.num=100))
+  pl.net <- adj2igraph(getRefit(net), vertex.attr=list(name=taxa_names(phylo)))
+  plist <- list(net, pl.net)
+  return(plist)
+}
+```
+
+```{r}
+# We can apply the network function directly to the list of phyloseq objects, and it will return a list of results back
+
+results <- lapply(acore_list, net_fun) #It will return a list of the results
+resultsb <- lapply(bcore_list, net_fun)
+resultsf <- lapply(fcore_list, net_fun)
+resultsv <- lapply(vcore_list, net_fun)
+```
+Create a function to store all metrics associated with the networks
+
+```{r}
+# Function to extract the only graphs from each farm. Returns a list that can be fed to the next function
+grap_list <- function(netlist){
+  result <-  list()
+  for (x in 1:length(netlist)) {
+    graph <- netlist[[x]][[2]]
+    result[x] <- list(graph)
+  }
+  return(result)
+}
+
+# Function to calculate all the graph metrics
+net_met <- function(graph) {
+  # Degree centrality and average degree
+  degree <- centr_degree(graph, mode = "all")
+  # Mean degree
+  d.mean <- mean(igraph::degree(graph, mode = "all"))
+  d.mean.norm <- mean(igraph::degree(graph, mode = "all", normalized = T))
+  # Closeness
+  closen <- igraph::closeness(graph, mode="all")
+  # Transitivity
+  trans <- transitivity(graph, type = "average")
+  # Modularity
+  wtc <- cluster_walktrap(graph)
+  modular <- modularity(graph, membership(wtc))
+  # Average path length
+  pathlen <- mean_distance(graph, directed = FALSE)
+  # Av. normalized betweenness 
+  between <- igraph::betweenness(graph, directed = T, normalized = T)
+  mean.bet <- mean(between)
+  met_list <- list(degree, d.mean, d.mean.norm, closen, trans, modular, pathlen, mean.bet)
+  return(met_list)
+}
+```
+
+Apply the metrics for each set of graphs. Resulst are stored in lists too.
+
+```{r}
+# For archaea
+
+a_graphs <- grap_list(results) # List of graphs for each farm with only the Archaea
+arch_metrics <- lapply(a_graphs, net_met) # List of metrics for each graph
+
+# For bacteria
+b_graphs <- grap_list(resultsb)
+bac_metrics <- lapply(b_graphs, net_met)
+
+# For eukaryotes
+f_graphs <- grap_list(resultsf)
+fun_metrics <- lapply(f_graphs, net_met)
+
+# For viruses
+v_graphs <- grap_list(resultsv)
+vir_metrics <- lapply(v_graphs, net_met)
+
+```
+
+## Newtork plot functions
+
+```{r color_edges}
+
+# Visualize using ggnet
+
+# Col vector up to 74 color samples
+col_vector74 = c("#7FC97F","#BEAED4","#FDC086","#FFFF99","#386CB0","#F0027F","#BF5B17","#666666","#1B9E77","#D95F02","#7570B3","#E7298A","#66A61E","#E6AB02","#A6761D","#666666","#A6CEE3","#1F78B4","#B2DF8A","#33A02C","#FB9A99","#E31A1C","#FDBF6F","#FF7F00","#CAB2D6","#6A3D9A","#FFFF99","#B15928","#FBB4AE","#B3CDE3","#CCEBC5","#DECBE4","#FED9A6","#FFFFCC","#E5D8BD","#FDDAEC","#F2F2F2","#B3E2CD","#FDCDAC","#CBD5E8","#F4CAE4","#E6F5C9","#FFF2AE","#F1E2CC","#CCCCCC","#E41A1C","#377EB8","#4DAF4A","#984EA3","#FF7F00","#FFFF33","#A65628","#F781BF","#999999","#66C2A5","#FC8D62","#8DA0CB","#E78AC3","#A6D854","#FFD92F","#E5C494","#B3B3B3","#8DD3C7","#FFFFB3","#BEBADA","#FB8072","#80B1D3","#FDB462","#B3DE69","#FCCDE5","#D9D9D9","#BC80BD","#CCEBC5","#FFED6F")
+
+# Add edged colors based on nodes connected
+
+## Create fucntion to color the edges of the graph based on its positive or negative correlation. 
+#The inverse covariance matrix is obtained via a form of regression, this way we calculate the direction (pos or neg) of the edges
+#Returns a list with the covariance matrix, the ids to be sued for the labeling, and the colors and weights of the edges.
+
+color_edges <- function(spiec, qgraph){
+  betaMat=as.matrix(symBeta(getOptBeta(spiec)))
+  otu.ids <- colnames(spiec[[1]]$data)
+  edges=E(qgraph)
+  edge.colors=c()
+  edge.weight=c()
+  for(e.index in 1:length(edges)){
+    adj.nodes=ends(qgraph,edges[e.index])
+    xindex=which(otu.ids==adj.nodes[1])
+    yindex=which(otu.ids==adj.nodes[2])
+    beta=betaMat[xindex,yindex]
+    if(beta>0){
+      edge.colors=append(edge.colors,"forestgreen")
+      #edge.weight= format(beta*100,digits=3)
+      weight= format(beta*100,digits=3)
+      edge.weight=append(edge.weight,weight)
+      cat("Beta pos:",beta,"\n")
+    }
+    else if(beta<0){
+      edge.colors=append(edge.colors,"red")
+      weight= format(beta*100,digits=3)
+      edge.weight=append(edge.weight,weight)
+      cat("Beta neg:",beta,"\n")
+    }
+  }
+  return(list(betaMat, otu.ids, edge.colors, edge.weight))
+}
+
+```
+
+```{r get_color_edges}
+# Try functions with the result list from SPIEC-EASI and igraph
+# We need to split by farm the original list with the graph and spiec results, as they contain both farms
+
+#Archea
+a_naff <- results[[1]]
+a_ous <- results[[2]]
+arch_colors_naff <- do.call(color_edges, a_naff)
+arch_colors_ous <- do.call(color_edges, a_ous)
+
+#Bacteria
+b_naff <- resultsb[[1]]
+b_ous <- resultsb[[2]]
+bact_colors_naff <- do.call(color_edges, b_naff)
+bact_colors_ous <- do.call(color_edges, b_ous)
+
+#Eukaryotes
+f_naff <- resultsf[[1]]
+f_ous <- resultsf[[2]]
+euk_colors_naff <- do.call(color_edges, f_naff)
+euk_colors_ous <- do.call(color_edges, f_ous)
+
+#Viruses
+v_naff <- resultsv[[1]]
+v_ous <- resultsv[[2]]
+vir_colors_naff <- do.call(color_edges, v_naff)
+vir_colors_ous <- do.call(color_edges, v_ous)
+```
+
+After calculating the value of each edge, and assigning a color to the positive and negative interaction, we need to create a function to produce the plots: one for each farm and kingdom (a total of 6 initially).
+
+```{r get_net}
+## Function to produce network plot
+
+get_net <- function(qgraph, physeq, colres){
+  # Associate colors to graph
+  E(qgraph)$color=colres[[3]]
+  E(qgraph)$weight=colres[[4]]
+  # Pick node name to the Genus level
+  tax_table(physeq) <- tax_table(physeq)[,"Phylum"]
+  #Taxa names for microbes
+  otu_ids <- V(qgraph)$name
+  idx <- which(row.names(tax_table(physeq)) %in% otu_ids)
+  taxa <- as.character(tax_table(physeq)[,"Phylum"])[idx]
+  net <- asNetwork(qgraph)
+  network.vertex.names(net) <- taxa
+  net %v% "Phylum" = as.character(taxa)
+  return(list(net, taxa))
+}
+
+nb_nodes <- c(vcount(b_ous_topnet) + vcount(b_naff_topnet))
+y = colorRampPalette(col_vector74)(nb_nodes)
+names(y) <- levels(as.factor(c(b_net_ous[[2]], b_net_naff[[2]])))
+get_netplot <- function(qgraph, net, taxa, colpalette){
+  #nb_nodes <- vcount(qgraph)
+  #y= colorRampPalette(col_vector74)(nb_nodes)
+  #names(y) <- levels(as.factor(taxa))
+  netplot <- ggnet2(net,
+              color = "Phylum",
+              palette = colpalette,
+              alpha = 0.75,
+              size = "degree", 
+              size.legend = NA,
+              #edge.label = "weight", 
+              #edge.size=1,
+              edge.color="color",
+              legend.position = "left",
+              #edge.alpha = 0.5,
+              label = FALSE 
+              #label.size = 3,
+              #edge.label.size = 3
+              ) +
+    guides(size = "none") +
+    guides(color = guide_legend(override.aes = list(size = 2))) +
+    guides(fill = guide_legend(ncol = 1)) +
+    #guides(size="none", col="none") +
+    ggtitle("Nafferton network")
+  return(netplot)
+}
+  
+```
+
+Now use these functions to produce the networks and plots
+
+```{r plot_net}
+## For archaea
+a_net_naff <- get_net(a_graphs[[1]], ac_naf, arch_colors_naff)
+a_naff_plot <- get_netplot(a_graphs[[1]], a_net_naff[[1]], a_net_naff[[2]], y)
+a_net_ous <- get_net(a_graphs[[2]], ac_ous, arch_colors_ous)
+a_ous_plot <- get_netplot(a_graphs[[2]], a_net_ous[[1]], a_net_ous[[2]], y)
+
+## For bacteria
+b_net_naff <- get_net(b_graphs[[1]], bc_naf, bact_colors_naff)
+b_naff_plot <- get_netplot(b_graphs[[1]], b_net_naff[[1]], b_net_naff[[2]])
+b_net_ous <- get_net(b_graphs[[2]], bc_ous, bact_colors_ous)
+b_ous_plot <- get_netplot(b_graphs[[2]], b_net_ous[[1]], b_net_ous[[2]])
+
+## For eukaryotes
+e_net_naff <- get_net(f_graphs[[1]], fc_naf, euk_colors_naff)
+e_naff_plot <- get_netplot(f_graphs[[1]], e_net_naff[[1]], e_net_naff[[2]], y)
+e_net_ous <- get_net(f_graphs[[2]], fc_ous, euk_colors_ous)
+e_ous_plot <- get_netplot(f_graphs[[2]], e_net_ous[[1]], e_net_ous[[2]], y)
+
+## For viruses
+v_net_naff <- get_net(v_graphs[[1]], vc_naf, vir_colors_naff)
+v_naff_plot <- get_netplot(v_graphs[[1]], v_net_naff[[1]], v_net_naff[[2]])
+v_net_ous <- get_net(v_graphs[[2]], vc_ous, vir_colors_ous)
+v_ous_plot <- get_netplot(v_graphs[[2]], v_net_ous[[1]], v_net_ous[[2]])
+```
+
+```{r}
+#Plot farms by kingdom together
+a_plot <- ggarrange(a_naff_plot, a_ous_plot, ncol = 2, nrow = 1)
+b_plot <- ggarrange(b_naff_plot, b_ous_plot, ncol = 2, nrow = 1)
+e_plot <- ggarrange(e_naff_plot, e_ous_plot, ncol = 2, nrow = 1)
+v_plot <- ggarrange(v_naff_plot, v_ous_plot, ncol = 2, nrow = 1)
+```
+
+####COMBINATION OF NETWORKS BY KINGDOM####
+
+First, create the functions to use multikindom SPIEC-EASI networks
+
+```{r}
+# Function to calculate the network correlations and the graph using both SPIEC-EASI and igraph for multi kingdom networks
+net_fun_multi <- function(phylo, phylo_two) {
+  net <- multi.spiec.easi(list(phylo, phylo_two), method="mb", lambda.min.ratio=1e-2, nlambda=20, pulsar.params=list(rep.num=100))
+  pl.net <- adj2igraph(getRefit(net), vertex.attr=list(name=c(taxa_names(phylo), taxa_names(phylo_two))))
+  plist <- list(net, pl.net)
+  return(plist)
+}
+```
+
+```{r}
+## Apply network function to combination inside two lists
+
+resultsbarch <- mapply(net_fun_multi, bcore_list, acore_list)
+resultsbaek <-  mapply(net_fun_multi, bcore_list, fcore_list)
+resultseukar <-  mapply(net_fun_multi, fcore_list, acore_list)
+resultsbavir <- mapply(net_fun_multi, bcore_list, vcore_list)
+resultsarvir <- mapply(net_fun_multi, acore_list, vcore_list)
+resultseukvir <- mapply(net_fun_multi, fcore_list, vcore_list)
+
+```
+
+Create the necessary objects to plot by combination and farm
+
+```{r graph_list_multi}
+# Create a new function to extract the graphs from the objects created
+
+# Function to extract the only graphs from each farm. Returns a list that can be fed to the next function
+grap_list_multi <- function(netlist){
+  finalist <-  list()
+  finalist[1] <- netlist[2,1]
+  finalist[2] <- netlist[2,2]
+  return(finalist)
+}
+
+```
+
+
+```{r}
+#Get the graphs and metrics
+
+baek_graphs <- grap_list_multi(resultsbaek) # List of graphs for each farm
+baek_metrics <- lapply(baek_graphs, net_met) # List of metrics for each graph
+
+barch_graphs <- grap_list_multi(resultsbarch)
+barch_metrics <- lapply(barch_graphs, net_met)
+
+eukar_graphs <- grap_list_multi(resultseukar)
+eukar_metrics <- lapply(eukar_graphs, net_met)
+
+bavir_graphs <- grap_list_multi(resultsbavir)
+bavir_metrics <- lapply(bavir_graphs, net_met)
+
+arvir_graphs <- grap_list_multi(resultsarvir)
+arvir_metrics <- lapply(arvir_graphs, net_met)
+
+eukvir_graphs <- grap_list_multi(resultseukvir)
+eukvir_metrics <- lapply(eukvir_graphs, net_met)
+
+# Finalize network plots
+
+baek_naff <- resultsbaek[,1]
+baek_ous <- resultsbaek[,2]
+baek_colors_naff <- do.call(color_edges, baek_naff)
+baek_colors_ous <- do.call(color_edges, baek_ous)
+
+barch_naff <- resultsbarch[,1]
+barch_ous <- resultsbarch[,2]
+barch_colors_naff <- do.call(color_edges, barch_naff)
+barch_colors_ous <- do.call(color_edges, barch_ous)
+
+eukar_naff <- resultseukar[,1]
+eukar_ous <- resultseukar[,2]
+eukar_colors_naff <- do.call(color_edges, eukar_naff)
+eukar_colors_ous <- do.call(color_edges, eukar_ous)
+
+bavir_naff <- resultsbavir[,1]
+bavir_ous <- resultsbavir[,2]
+bavir_colors_naff <- do.call(color_edges, bavir_naff)
+bavir_colors_ous <- do.call(color_edges, bavir_ous)
+
+arvir_naff <- resultsarvir[,1]
+arvir_ous <- resultsarvir[,2]
+arvir_colors_naff <- do.call(color_edges, arvir_naff)
+arvir_colors_ous <- do.call(color_edges, arvir_ous)
+
+eukvir_naff <- resultseukvir[,1]
+eukvir_ous <- resultseukvir[,2]
+eukvir_colors_naff <- do.call(color_edges, eukvir_naff)
+eukvir_colors_ous <- do.call(color_edges, eukvir_ous)
+```
+
+Create the functions adapted to extract the node info from two different phyloseq objects
+
+```{r get_net}
+## Function to produce network plot
+colnames(v_naff_phy@tax_table) <- c("Kingdom", "Phylum", "Class", "Order", "Family", "Genus", "Species")
+colnames(v_ous_phy@tax_table) <- c("Kingdom", "Phylum", "Class", "Order", "Family", "Genus", "Species")
+
+get_net_multi <- function(qgraph, physeq, physeq2, colres){
+  # Associate colors to graph
+  E(qgraph)$color=colres[[3]]
+  E(qgraph)$weight=colres[[4]]
+  # Pick node name to the Genus level
+  tax_table(physeq) <- tax_table(physeq)[,"Phylum"]
+  tax_table(physeq2) <- tax_table(physeq2)[,'Kingdom']
+  #Taxa names for microbes in pseq 1 and 2
+  otu_ids <- V(qgraph)$name
+  idx <- which(row.names(tax_table(physeq)) %in% otu_ids)
+  taxa <- as.character(tax_table(physeq)[,"Phylum"])[idx]
+  votu_ids <- V(qgraph)$name
+  vidx <- which(row.names(tax_table(physeq2)) %in% votu_ids)
+  vtaxa <- as.character(tax_table(physeq2)[,"Kingdom"])[vidx]
+  #Network adaptations
+  net <- asNetwork(qgraph)
+  network.vertex.names(net) <- c(taxa, vtaxa)
+  net %v% "Kingdom" = as.character(c(taxa,vtaxa))
+  return(list(net, taxa, vtaxa))
+}
+
+nb_nodes <- vcount(eukvir_ous_topnet)
+y= col_vector74[1:nb_nodes]
+names(y) <- levels(as.factor(c(eukvir_net_ous[[2]], eukvir_net_ous[[3]])))
+get_netplot_multi <- function(qgraph, net, taxa, vtaxa, colpalette){
+  #nb_nodes <- vcount(qgraph)
+  #y= col_vector74[1:nb_nodes]
+  #names(y) <- levels(as.factor(c(taxa, vtaxa)))
+  netplot <- ggnet2(net,
+              color = "Kingdom",
+              palette = colpalette,
+              alpha = 0.75,
+              #size = 6,
+              size = "degree",
+              size.legend = NA,
+              #edge.label = "weight", 
+              #edge.size=1,
+              edge.color="color",
+              legend.position = "left",
+              #edge.alpha = 0.5,
+              label = FALSE
+              #label.size = 3,
+              #edge.label.size = 3
+              ) +
+    guides(size='none') +
+    guides(color = guide_legend(override.aes = list(size = 3))) +
+    #guides(col="none") +
+    ggtitle("Nafferton network")
+  return(netplot)
+}
+```
+
+Produce the final plots for each network
+
+```{r plots, results='hide'}
+## For bac+euk
+baek_net_naff <- get_net_multi(baek_graphs[[1]], bc_naf, fc_naf, baek_colors_naff)
+baek_naff_plot <- get_netplot_multi(baek_graphs[[1]], baek_net_naff[[1]], baek_net_naff[[2]], baek_net_naff[[3]])
+baek_net_ous <- get_net_multi(baek_graphs[[2]], bc_ous, fc_ous, baek_colors_ous)
+baek_ous_plot <- get_netplot_multi(baek_graphs[[2]], baek_net_ous[[1]], baek_net_ous[[2]], baek_net_ous[[3]])
+
+## For bac+arch
+barch_net_naff <- get_net_multi(barch_graphs[[1]], bc_naf, ac_naf, barch_colors_naff)
+barch_naff_plot <- get_netplot_multi(barch_graphs[[1]], barch_net_naff[[1]], barch_net_naff[[2]], barch_net_naff[[3]])
+barch_net_ous <- get_net_multi(barch_graphs[[2]], bc_ous, ac_ous, barch_colors_ous)
+barch_ous_plot <- get_netplot_multi(barch_graphs[[2]], barch_net_ous[[1]], barch_net_ous[[2]], barch_net_ous[[3]])
+
+## For arch+euk
+eukar_net_naff <- get_net_multi(eukar_graphs[[1]], ac_naf, fc_naf, eukar_colors_naff)
+eukar_naff_plot <- get_netplot_multi(eukar_graphs[[1]], eukar_net_naff[[1]], eukar_net_naff[[2]], eukar_net_naff[[3]])
+eukar_net_ous <- get_net_multi(eukar_graphs[[2]], ac_ous, fc_ous, eukar_colors_ous)
+eukar_ous_plot <- get_netplot_multi(eukar_graphs[[2]], eukar_net_ous[[1]], eukar_net_ous[[2]], eukar_net_ous[[3]])
+
+## For bac+vir
+bavir_net_naff <- get_net_multi(bavir_graphs[[1]], bc_naf, v_naff_phy, bavir_colors_naff)
+bavir_naff_plot <- get_netplot_multi(bavir_graphs[[1]], bavir_net_naff[[1]], bavir_net_naff[[2]], bavir_net_naff[[3]])
+bavir_net_ous <- get_net_multi(bavir_graphs[[2]], bc_ous, v_ous_phy, bavir_colors_ous)
+bavir_ous_plot <- get_netplot_multi(bavir_graphs[[2]], bavir_net_ous[[1]], bavir_net_ous[[2]], bavir_net_ous[[3]])
+
+## For vir+arch
+arvir_net_naff <- get_net_multi(arvir_graphs[[1]], ac_naf, v_naff_phy, arvir_colors_naff)
+arvir_naff_plot <- get_netplot_multi(arvir_graphs[[1]], arvir_net_naff[[1]], arvir_net_naff[[2]], arvir_net_naff[[3]])
+arvir_net_ous <- get_net_multi(arvir_graphs[[2]], ac_ous, v_ous_phy, arvir_colors_ous)
+arvir_ous_plot <- get_netplot_multi(arvir_graphs[[2]], arvir_net_ous[[1]], arvir_net_ous[[2]], arvir_net_ous[[3]])
+
+## For vir+euk
+eukvir_net_naff <- get_net_multi(eukvir_graphs[[1]], fc_naf, v_naff_phy, eukvir_colors_naff)
+eukvir_naff_plot <- get_netplot_multi(eukvir_graphs[[1]], eukvir_net_naff[[1]], eukvir_net_naff[[2]], eukvir_net_naff[[3]])
+eukvir_net_ous <- get_net_multi(eukvir_graphs[[2]], fc_ous, v_ous_phy, eukvir_colors_ous)
+eukvir_ous_plot <- get_netplot_multi(eukvir_graphs[[2]], eukvir_net_ous[[1]], eukvir_net_ous[[2]], eukvir_net_ous[[3]])
+```
+
+Create phyloseq object with top 25 OTU by kingdom for easy plots
+
+```{r top_otu, results='hide'}
+top_otu <- function(phylo){
+  top.names <- names(sort(taxa_sums(phylo), TRUE)[1:25])
+  top <- prune_taxa(top.names, phylo)
+  top.pseq <- prune_taxa(taxa_names(top), phylo)
+  return(top.pseq)
+}
+
+#Calculate top 25 OTUs per farm and kingdom
+top_bac_naf <- top_otu(bc_naf)
+top_bac_ous <- top_otu(bc_ous)
+top_arc_naf <- top_otu(ac_naf)
+top_arc_ous <- top_otu(ac_ous)
+top_euk_naf <- top_otu(fc_naf)
+top_euk_ous <- top_otu(fc_ous)
+top_vir_naf <- top_otu(v_naff_phy)
+top_vir_ous <- top_otu(v_ous_phy)
+```
+
+```{r top_graph}
+# Function to extract the subgraph with 25 OTU
+top_graph <- function(phylo, phylo2, qgraph){
+  nodes_of_interest <- c(taxa_names(phylo), taxa_names(phylo2))
+  selnodes <- V(qgraph)[name %in% nodes_of_interest]
+  selegoV <- ego(qgraph, order=1, nodes = selnodes, mode = "all", mindist = 0)
+  top.graph <- induced_subgraph(qgraph,unlist(selegoV))
+  return(top.graph)
+}
+
+top_graph_single <- function(phylo, qgraph){
+  nodes_of_interest <- taxa_names(phylo)
+  selnodes <- V(qgraph)[name %in% nodes_of_interest]
+  selegoV <- ego(qgraph, order=1, nodes = selnodes, mode = "all", mindist = 0)
+  top.graph <- induced_subgraph(qgraph,unlist(selegoV))
+  return(top.graph)
+}
+```
+
+```{r}
+baek_naff_topnet <- top_graph(top_bac_naf, top_euk_naf, baek_graphs[[1]])
+baek_ous_topnet <- top_graph(top_bac_ous, top_euk_ous, baek_graphs[[2]])
+barch_naff_topnet <- top_graph(top_bac_naf, top_arc_naf, barch_graphs[[1]])
+barch_ous_topnet <- top_graph(top_bac_ous, top_arc_ous, barch_graphs[[2]])
+eukar_naff_topnet <- top_graph(top_arc_naf, top_euk_naf, eukar_graphs[[1]])
+eukar_ous_topnet <- top_graph(top_arc_ous, top_euk_ous, eukar_graphs[[2]])
+bavir_naff_topnet <- top_graph(top_bac_naf, top_vir_naf, bavir_graphs[[1]])
+bavir_ous_topnet <- top_graph(top_bac_ous, top_vir_ous, bavir_graphs[[2]])
+arvir_naff_topnet <- top_graph(top_arc_naf, top_vir_naf, arvir_graphs[[1]])
+arvir_ous_topnet <- top_graph(top_arc_ous, top_vir_ous, arvir_graphs[[2]])
+eukvir_naff_topnet <- top_graph(top_euk_naf, top_vir_naf, eukvir_graphs[[1]])
+eukvir_ous_topnet <- top_graph(top_euk_ous, top_vir_ous, eukvir_graphs[[2]])
+
+```
+
+Obtain top networks from single-kingdom plots
+
+```{r}
+b_naff_topnet <- top_graph_single(top_bac_naf, b_graphs[[1]])
+b_ous_topnet <- top_graph_single(top_bac_ous, b_graphs[[2]])
+a_naff_topnet <- top_graph_single(top_arc_naf, a_graphs[[1]])
+a_ous_topnet <- top_graph_single(top_arc_ous, a_graphs[[2]])
+f_naff_topnet <- top_graph_single(top_euk_naf, f_graphs[[1]])
+f_ous_topnet <- top_graph_single(top_euk_ous, f_graphs[[2]])
+v_naff_topnet <- top_graph_single(top_vir_naf, v_graphs[[1]])
+v_ous_topnet <- top_graph_single(top_vir_ous, v_graphs[[2]])
+```
+
+
+
+Produce new plots with the top 25 OTUs. First, for the single-kingdom plots:
+
+```{r results='hide'}
+## For archaea
+arch_colors_naff <- color_edges(a_naff[[1]], a_naff_topnet)
+a_net_naff <- get_net(a_naff_topnet, ac_naf, arch_colors_naff)
+a_naff_plot <- get_netplot(a_naff_topnet, a_net_naff[[1]], a_net_naff[[2]], y)
+arch_colors_ous <- color_edges(a_ous[[1]], a_ous_topnet)
+a_net_ous <- get_net(a_ous_topnet, ac_ous, arch_colors_ous)
+a_ous_plot <- get_netplot(a_graphs[[2]], a_net_ous[[1]], a_net_ous[[2]], y)
+
+## For bacteria
+bact_colors_naff <- color_edges(b_naff[[1]], b_naff_topnet)
+b_net_naff <- get_net(b_naff_topnet, bc_naf, bact_colors_naff)
+b_naff_plot <- get_netplot(b_naff_topnet, b_net_naff[[1]], b_net_naff[[2]], y)
+bact_colors_ous <- color_edges(b_ous[[1]], b_ous_topnet)
+b_net_ous <- get_net(b_ous_topnet, bc_ous, bact_colors_ous)
+b_ous_plot <- get_netplot(b_ous_topnet, b_net_ous[[1]], b_net_ous[[2]], y)
+
+## For eukaryotes
+euk_colors_naff <- color_edges(f_naff[[1]], f_naff_topnet)
+e_net_naff <- get_net(f_naff_topnet, fc_naf, euk_colors_naff)
+e_naff_plot <- get_netplot(f_naff_topnet, e_net_naff[[1]], e_net_naff[[2]], y)
+euk_colors_ous <- color_edges(f_ous[[1]], f_ous_topnet)
+e_net_ous <- get_net(f_ous_topnet, fc_ous, euk_colors_ous)
+e_ous_plot <- get_netplot(f_ous_topnet, e_net_ous[[1]], e_net_ous[[2]], y)
+
+## For viruses
+vir_colors_naff <- color_edges(v_naff[[1]], v_naff_topnet)
+v_net_naff <- get_net(v_naff_topnet, vc_naf, vir_colors_naff)
+v_naff_plot <- get_netplot(v_naff_topnet, v_net_naff[[1]], v_net_naff[[2]])
+vir_colors_ous <- color_edges(v_ous[[1]], v_ous_topnet)
+v_net_ous <- get_net(v_ous_topnet, vc_ous, vir_colors_ous)
+v_ous_plot <- get_netplot(v_ous_topnet, v_net_ous[[1]], v_net_ous[[2]])
+```
+
+
+```{r new_plot, echo=TRUE, results='hide'}
+## For bac+euk
+baek_colors_naff <- color_edges(baek_naff[[1]], baek_naff_topnet)
+baek_net_naff <- get_net_multi(baek_naff_topnet, bc_naf, fc_naf, baek_colors_naff)
+baek_naff_plot <- get_netplot_multi(baek_naff_topnet, baek_net_naff[[1]], baek_net_naff[[2]], baek_net_naff[[3]])
+#Ouseburn
+baek_colors_ous <- color_edges(baek_ous[[1]], baek_ous_topnet)
+baek_net_ous <- get_net_multi(baek_ous_topnet, bc_ous, fc_ous, baek_colors_ous)
+baek_ous_plot <- get_netplot_multi(baek_ous_topnet, baek_net_ous[[1]], baek_net_ous[[2]], baek_net_ous[[3]])
+
+## For bac+arch
+barch_colors_naff <- color_edges(barch_naff[[1]], barch_naff_topnet)
+barch_net_naff <- get_net_multi(barch_naff_topnet, bc_naf, ac_naf, barch_colors_naff)
+barch_naff_plot <- get_netplot_multi(barch_naff_topnet, barch_net_naff[[1]], barch_net_naff[[2]], barch_net_naff[[3]])
+#Ouseburn
+barch_colors_ous <- color_edges(barch_ous[[1]], barch_ous_topnet)
+barch_net_ous <- get_net_multi(barch_ous_topnet, bc_ous, ac_ous, barch_colors_ous)
+barch_ous_plot <- get_netplot_multi(barch_ous_topnet, barch_net_ous[[1]], barch_net_ous[[2]], barch_net_ous[[3]])
+
+## For arch+euk
+eukar_colors_naff <- color_edges(eukar_naff[[1]], eukar_naff_topnet)
+eukar_net_naff <- get_net_multi(eukar_naff_topnet, ac_naf, fc_naf, eukar_colors_naff)
+eukar_naff_plot <- get_netplot_multi(eukar_naff_topnet, eukar_net_naff[[1]], eukar_net_naff[[2]], eukar_net_naff[[3]])
+#Ouseburn
+eukar_colors_ous <- color_edges(eukar_ous[[1]], eukar_ous_topnet)
+eukar_net_ous <- get_net_multi(eukar_ous_topnet, ac_ous, fc_ous, eukar_colors_ous)
+eukar_ous_plot <- get_netplot_multi(eukar_ous_topnet, eukar_net_ous[[1]], eukar_net_ous[[2]], eukar_net_ous[[3]])
+
+## For bac+vir
+bavir_colors_naff <- color_edges(bavir_naff[[1]], bavir_naff_topnet)
+bavir_net_naff <- get_net_multi(bavir_naff_topnet, bc_naf, v_naff_phy, bavir_colors_naff)
+bavir_naff_plot <- get_netplot_multi(bavir_naff_topnet, bavir_net_naff[[1]], bavir_net_naff[[2]], bavir_net_naff[[3]])
+#Ouseburn
+bavir_colors_ous <- color_edges(bavir_ous[[1]], bavir_ous_topnet)
+bavir_net_ous <- get_net_multi(bavir_ous_topnet, bc_ous, v_ous_phy, bavir_colors_ous)
+bavir_ous_plot <- get_netplot_multi(bavir_ous_topnet, bavir_net_ous[[1]], bavir_net_ous[[2]], bavir_net_ous[[3]])
+
+## For vir+arch
+arvir_colors_naff <- color_edges(arvir_naff[[1]], arvir_naff_topnet)
+arvir_net_naff <- get_net_multi(arvir_naff_topnet, ac_naf, v_naff_phy, arvir_colors_naff)
+arvir_naff_plot <- get_netplot_multi(arvir_naff_topnet, arvir_net_naff[[1]], arvir_net_naff[[2]], arvir_net_naff[[3]], y)
+#Ouseburn
+arvir_colors_ous <- color_edges(arvir_ous[[1]], arvir_ous_topnet)
+arvir_net_ous <- get_net_multi(arvir_ous_topnet, ac_ous, v_ous_phy, arvir_colors_ous)
+arvir_ous_plot <- get_netplot_multi(arvir_ous_topnet, arvir_net_ous[[1]], arvir_net_ous[[2]], arvir_net_ous[[3]], y)
+
+## For vir+euk
+eukvir_colors_naff <- color_edges(eukvir_naff[[1]], eukvir_naff_topnet)
+eukvir_net_naff <- get_net_multi(eukvir_naff_topnet, fc_naf, v_naff_phy, eukvir_colors_naff)
+eukvir_naff_plot <- get_netplot_multi(eukvir_naff_topnet, eukvir_net_naff[[1]], eukvir_net_naff[[2]], eukvir_net_naff[[3]], y)
+#Ouseburn
+eukvir_colors_ous <- color_edges(eukvir_ous[[1]], eukvir_ous_topnet)
+eukvir_net_ous <- get_net_multi(eukvir_ous_topnet, fc_ous, v_ous_phy, eukvir_colors_ous)
+eukvir_ous_plot <- get_netplot_multi(eukvir_ous_topnet, eukvir_net_ous[[1]], eukvir_net_ous[[2]], eukvir_net_ous[[3]], y)
+```
+
+Now, structure the all the network plots
+
+```{r}
+baek_plot <- ggarrange(baek_naff_plot, baek_ous_plot, ncol = 2, nrow = 1)
+barch_plot <- ggarrange(barch_naff_plot, barch_ous_plot, ncol = 2, nrow = 1)
+eukar_plot <- ggarrange(eukar_naff_plot, eukar_ous_plot, ncol = 2, nrow = 1)
+bavir_plot <- ggarrange(bavir_naff_plot, bavir_ous_plot, ncol = 2, nrow = 1)
+arvir_plot <- ggarrange(arvir_naff_plot, arvir_ous_plot, ncol = 2, nrow = 1)
+eukvir_plot <- ggarrange(eukvir_naff_plot, eukvir_ous_plot, ncol = 2, nrow = 1)
+blank <- plot.new()
+
+net_final_plot <- grid.arrange(b_plot, baek_plot, barch_plot, bavir_plot, e_plot, eukar_plot, eukvir_plot, a_plot, arvir_plot, v_plot, blank, ncol = 4, layout_matrix = cbind(c(1,2,3,4), c(11,5,6,7), c(11,11,8,9), c(11,11,11,10)))
+
+ggsave(file="final_net_plot_4.svg", plot=net_final_plot, width=45, height=20)
+```
+
+Separate the final plots into chunks for better visualization on the thesis document
+
+```{r}
+top_plot <- grid.arrange(b_plot, baek_plot, barch_plot, bavir_plot, e_plot, eukar_plot, eukvir_plot, blank, layout_matrix = cbind(c(1,2, 3, 4), c(8, 5, 6, 7)))
+ggsave(file="top_net_plot.svg", plot=top_plot, width=18, height=15)
+bottom_plot <- grid.arrange(a_plot, arvir_plot, v_plot, blank, layout_matrix = cbind(c(1,2), c(4, 3)))
+ggsave(file="bottom_net_plot.svg", plot=bottom_plot, width=20, height=8)
+```
+
+
+
