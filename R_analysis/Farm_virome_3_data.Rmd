@@ -1,0 +1,220 @@
+---
+title: "Virome analysis of farms"
+author: "Bea"
+date: "2023-03-24"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+#Load packages
+library("phyloseq")
+library("ggplot2")
+library("RColorBrewer")
+library("patchwork")
+library("microbiome")
+library("ape")
+library("vegan")
+library('tidyverse')
+library("ecodist")
+library("viridis")
+library("igraph")
+library("GGally")
+library("intergraph")
+library("network")
+library("SpiecEasi")
+library("SCRuB")
+library("ggpubr")
+
+#Set working directory
+knitr::opts_knit$set(root.dir = "/Users/beatrizdelgadocorrales/Desktop/PhD-BE_Microbiome/Virome_farms/")
+
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Prepare virome phyloseq object
+
+```{r phyloseq}
+# Upload vOTU table
+
+vOTU <- read.table('./vOTU_table.csv', sep = ",", header = TRUE, row.names = 1)
+colnames(vOTU) <- gsub("X*", "", as.character(colnames(vOTU)))
+colnames(vOTU) <- gsub("*.RPKM", "", as.character(colnames(vOTU)))
+colnames(vOTU) <- gsub("_.*", "", as.character(colnames(vOTU)))
+
+# Upload taxonomy table
+
+taxa <- read.table('./derep_virus_class.txt', sep = "\t", header = TRUE, row.names = 1)
+taxa <- taxa['Genus'] %>% 
+  add_column(Domain = 'Virus',
+             Phylum = NA,
+             Class = NA,
+             Order = NA,
+             Family = NA,
+             Species = NA)
+taxa <- taxa[, c(2,3,4,5,6,1,7)] 
+taxa[is.na(taxa)] <- "Unassigned"
+taxa <- as.matrix(taxa) # This is needed to avoid getting an error when creating the phyloseq object
+
+# Upload metadata
+
+metadata <- read.table(file = '../new_farm_metadata.tsv', sep = '\t', header = TRUE) #import metadata
+rownames(metadata) <- metadata$Id
+metadata$Id <- NULL
+metadata <- metadata %>% 
+  mutate(is.neg = if_else(is.na(Time) == TRUE, 'TRUE', 'FALSE'))
+metadata['NuPos', "is.neg"] = FALSE
+
+# Create phyloseq object
+
+OTU = otu_table(vOTU, taxa_are_rows = TRUE)
+TAX = tax_table(taxa)
+all_vseq = phyloseq(OTU, TAX, sample_data(metadata))
+```
+
+Remove vOTUs of poor quality using CheckV output 
+```{r}
+checkv <- read.csv(file = './good_quality_virus.csv', header = TRUE)
+vOTU_keep <- checkv$contig_id
+
+#Subset phyloseq object
+vseq <- prune_taxa(vOTU_keep, all_vseq)
+```
+
+
+## DECONTAMINATION USING SCRUB
+
+Based on how good the decontamination step was done by scrub with the whole microbiome, we are using SCRuB directly on the virome:
+
+```{r clean}
+# Remove mixed samples 
+to_remove <- c("66", "67", "VKB", "SWABb", "NuNeg", "SKB")
+#to_remove <- c("VKB", "SWABb")
+vseq <- prune_samples(!(sample_names(vseq) %in% to_remove), vseq)
+```
+
+```{r scrub}
+# Create a filtered metadata for SCRUB
+
+scrub_vmeta <- data.frame(sample_data(vseq)) %>% 
+  dplyr::select(is.neg, Farm) %>% 
+  dplyr::rename(is_control = is.neg, sample_type = Farm)
+#scrub_vmeta['66', "is_control"] = TRUE
+#scrub_vmeta['67', "is_control"] = TRUE
+#scrub_vmeta['66', "sample_type"] = "Blank1"
+#scrub_vmeta['67', "sample_type"] = "Blank2"
+
+# Create the OTU matrix, which needs to have samples as rows and needs to match with the rows in the metadata
+
+scrub_votu <- t(data.frame(otu_table(vseq), check.names = FALSE)) %>% 
+  as.matrix()
+  
+# Run SCRuB
+
+scr_vout <- SCRuB(scrub_votu, scrub_vmeta)
+
+```
+
+Now, inspect the elements of the SCRuB output
+
+```{r scr_out}
+scr_vout$p %>% 
+  boxplot()
+
+scr_vout$inner_iterations$`Buffer`$gamma %>% 
+  plot()
+#scr_vout$inner_iterations$`Soil_Kit`$gamma %>% 
+  plot()
+#scr_vout$inner_iterations$`Sequencing`$gamma %>% 
+  plot()
+```
+Select the OTU table from the decontamination results to create a new phyloseq object
+
+```{r}
+decontaminated_samples_v <- data.frame(scr_vout$decontaminated_samples, check.names = FALSE)
+decontaminated_samples_v[1:10, 25:40] #Check vOTU structure
+```
+```{r scrub_pseq}
+# Create phyloseq object with the scrub results
+
+scrub_tax_v <- data.frame(tax_table(vseq), check.names = FALSE)
+
+length(row.names(t(decontaminated_samples_v))) # Check length of OTU table from SCRUB
+length(row.names(scrub_tax_v)) # Check length of Tax table from original data
+
+# Remove blanks from sample metadata before merging
+# I'm using the original data frame because I cant transform the phyloseq metadata
+
+decon_meta_v <- metadata %>% 
+  filter(Farm=="Ouseburn" | Farm =="Nafferton") %>% 
+  filter(SampleName!="OffLNa-3" & SampleName!="PtSLNa-3")
+
+# Create different parts of phyloseq object
+
+vOTU <- phyloseq::otu_table(t(data.frame(decontaminated_samples_v, check.names = FALSE)), taxa_are_rows = TRUE)
+vTAX <- phyloseq::tax_table(as.matrix(scrub_tax_v))
+vMETA <- phyloseq::sample_data(decon_meta_v)
+
+scr_vseq <- phyloseq(vOTU, vTAX, vMETA)
+```
+
+## CORE VIROME PLOTS
+
+```{r abun}
+vseq.rel <- microbiome::transform(scr_vseq, "compositional")
+vseq.core <- core(vseq.rel, detection = .1/100, prevalence = 25/100)
+```
+
+
+```{r barplot}
+# Combine vOTU by Genus at the main level (not core microbiome)
+vseq_genus <- aggregate_taxa(vseq.rel, level = 'Genus') 
+
+colourCount = length(vseq_genus@tax_table@.Data[,"unique"])
+#vircolor <- colorRampPalette(brewer.pal(12, "Set3"))
+mycolor <- randomcoloR::distinctColorPalette(k = colourCount)
+viral_barplot <- plot_bar(vseq_genus, x="SampleName", y="Abundance", fill="Genus") +
+  guides(fill=guide_legend(ncol=2)) +
+  #scale_fill_manual(values = mycolor) +
+  scale_fill_viridis(discrete = TRUE, option = "mako") +
+  #geom_col(color = 'white', linewidth= 0.1)
+  scale_x_discrete(guide = guide_axis(angle = 45)) +
+  facet_grid(~Farm + Room, scales = "free_x", space = "free_x") +
+  theme(strip.text.x = element_text(size=10))
+  #guides(fill=guide_legend(title = "Taxa")) +
+  #guides(fill="none")
+
+viral_barplot
+```
+
+```{r}
+bar_legend <- get_legend(viral_barplot)
+grid.draw(bar_legend)
+```
+
+
+```{r heatmap}
+# Heatmap
+plot_heatmap(vseq.core, method = 'NMDS', distance = 'bray', 
+             sample.order = 'Farm', 
+             taxa.label = 'Genus', 
+             taxa.order = 'Genus', 
+             sample.label = 'SampleName',
+             na.value = "black") +
+  scale_fill_viridis()
+```
+## ALPHA DIVERSITY
+
+```{r}
+rich_m <- plot_richness(physeq = scr_vseq, measures = c("Shannon"), color = "Farm", x = "Farm") +
+  geom_boxplot(outlier.shape = NA) +
+  scale_color_viridis_d(option = "plasma")
+rich_m$layers[1] <- NULL
+rich_m2 <- plot_richness(physeq = scr_vseq, measures = c("Shannon"), color = "RoomType", x = "Farm") +
+  geom_boxplot(outlier.shape = NA) +
+  scale_colour_viridis_d(option = "plasma")
+rich_m2$layers[1] <- NULL
+
+
+#Create multiplot of alpha diversity
+ggarrange(rich_m, rich_m2, labels = c("Farm", "Farm+Room"), ncol = 2)
+```

@@ -1,0 +1,387 @@
+---
+title: "Virome of farms statistical analysis"
+author: "Bea"
+date: "2023-03-27"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library("phyloseq")
+library("ggplot2")
+library("RColorBrewer")
+library("patchwork")
+library("microbiome")
+library("ape")
+library("vegan")
+library("decontam")
+library('tidyverse')
+library("ecodist")
+library("viridis")
+library("ANCOMBC")
+library("DESeq2")
+
+#Set working directory
+knitr::opts_knit$set(root.dir = "/Users/beatrizdelgadocorrales/Desktop/PhD-BE_Microbiome/Virome_farms/")
+
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## CALCULATION OF CLR AND DISTANCES
+
+As we did with the microbiome, let's calculate the CLR and distances according to the same principle: virome data is compositional
+
+```{r cars}
+vps_clr <- microbiome::transform(scr_vseq, "clr") #calculate centered-log ratio
+vord_clr <- phyloseq::ordinate(vps_clr, "PCoA", distance = "euclidean")
+phyloseq::plot_scree(vord_clr) + 
+  geom_bar(stat="identity", fill = "blue") +
+  labs(x = "\nAxis", y = "Proportion of Variance\n")
+```
+```{r}
+vclr1 <- vord_clr$CA$eig[1] / sum(vord_clr$CA$eig)
+vclr2 <- vord_clr$CA$eig[2] / sum(vord_clr$CA$eig)
+phyloseq::plot_ordination(scr_vseq, vord_clr, type="samples", color="RoomType") + 
+  geom_point(size = 2) +
+  #coord_fixed(vclr2 / vclr1) +
+  stat_ellipse(aes(group = RoomType), linetype = 2)
+phyloseq::plot_ordination(scr_vseq, vord_clr, type="samples", color="Farm") + 
+  geom_point(size = 2) +
+  #coord_fixed(vclr2 / vclr1) +
+  stat_ellipse(aes(group = Farm), linetype = 2)
+phyloseq::plot_ordination(scr_vseq, vord_clr, type="samples", color="Season") + 
+  geom_point(size = 2) +
+  #coord_fixed(vclr2 / vclr1) +
+  stat_ellipse(aes(group = Season), linetype = 2)
+```
+
+```{r}
+#Generate distance matrix
+vclr_dist_matrix <- phyloseq::distance(vps_clr, method = "euclidean")
+
+#ADONIS test is done in the other Rmarkdown
+#vegan::adonis2(clr_dist_matrix ~ phyloseq::sample_data(ps_clr)$RoomType, perm=999, method = "euclidean")
+
+vdispr_room <- vegan::betadisper(vclr_dist_matrix, phyloseq::sample_data(vps_clr)$RoomType)
+vdispr_farm <- vegan::betadisper(vclr_dist_matrix, phyloseq::sample_data(vps_clr)$Farm)
+vdispr_season <- vegan::betadisper(vclr_dist_matrix, phyloseq::sample_data(vps_clr)$Season)
+plot(vdispr_room, main = "Ordination Centroids and Dispersion Labeled: Aitchison Distance", sub = "")
+plot(vdispr_farm, main = "Ordination Centroids and Dispersion Labeled: Aitchison Distance", sub = "")
+plot(vdispr_season, main = "Ordination Centroids and Dispersion Labeled: Aitchison Distance", sub = "")
+boxplot(vdispr_room, main = "", xlab = "")
+boxplot(vdispr_farm, main = "", xlab = "")
+boxplot(vdispr_season, main = "", xlab = "")
+```
+```{r}
+plot_ordination(scr_vseq, ordination = vord_clr, color="Farm", label = "SampleName", 
+    title=paste0("PCoA plot based")) + 
+    theme(legend.position="bottom")
+```
+## permANOVA tests on different factors
+
+Let's try the Adonis2 function from the vegan package to do the test.
+
+```{r permanova}
+vpermanova <- vegan::adonis2(vclr_dist_matrix ~ phyloseq::sample_data(vps_clr)$RoomType*phyloseq::sample_data(vps_clr)$Farm*phyloseq::sample_data(vps_clr)$Season, perm=999, method = "euclidean") 
+```
+
+
+```{r}
+vipermanova <- as.data.frame(vpermanova)
+write.csv(vipermanova, file = './vpermanova.csv', row.names = TRUE)
+```
+
+## DIFFERENTIAL ABUNDANCE ANALYSIS
+
+After checking which factors are relevant and impact microbiome composition in our samples, let's checks which microorganisms are significantly different between the two farms (this can be done with other factor but let's start at this level)
+For this test, we'll combine three different methods: ALDEx2, ANCOM-II, DESeq2, as there is no gold standard method for DA in microbiome data, so a combination of OTUs detected by the three methods will be chosen.
+
+#ALDEx2
+Let's try ALDEx2 first:
+
+```{r aldex2, echo=FALSE}
+valdex2_da <- ALDEx2::aldex(data.frame(phyloseq::otu_table(scr_vseq)), phyloseq::sample_data(scr_vseq)$Farm, test="t", effect = TRUE, denom="iqlr")
+```
+
+Now, let's plot the results to visualize the amount of OTUs that can be considered differential abundant.
+
+```{r }
+# Plot effect sizes
+
+ALDEx2::aldex.plot(valdex2_da, type="MW", test="wilcox", called.cex = 1, cutoff = 0.05)
+ALDEx2::aldex.plot(valdex2_da, type="MA", test="welch", xlab="Log-ratio abundance", ylab="Difference")
+ALDEx2::aldex.plot(valdex2_da, type="MW", test="welch", xlab="Dispersion", ylab="Difference")
+
+```
+
+Now, filter results by BH FDR values (leaving only significant results) and by Effect Size, to discriminate actually relevant OTUs
+
+```{r}
+#Clean up presentation
+
+vtaxa_info <- data.frame(tax_table(scr_vseq))
+vtaxa_info <- vtaxa_info %>% 
+  rownames_to_column(var = "OTU")
+
+vsig_aldex2 <- valdex2_da %>%
+  rownames_to_column(var = "OTU") %>%
+  filter(wi.eBH < 0.05) %>% # Filter by BH FDR value
+  filter(effect > abs(0.8)) %>% # Filter by ES pos. or neg. 
+  arrange(effect, wi.eBH) %>%
+  dplyr::select(OTU, diff.btw, diff.win, effect, wi.ep, wi.eBH)
+vsig_aldex2 <- left_join(vsig_aldex2, vtaxa_info)
+
+```
+
+Again, plot the refined results to discriminate between OTUs founds as DA using both statistical methods used by ALDEx2. 
+
+```{r}
+# identify which values are significant in both the t-test and glm tests
+found.by.all <- which(valdex2_da$we.eBH < 0.05 & valdex2_da$wi.eBH < 0.05)
+
+# identify which values are significant in fewer than all tests
+found.by.one <- which(valdex2_da$we.eBH < 0.05 | valdex2_da$wi.eBH < 0.05)
+
+# plot the within and between variation of the data
+plot(valdex2_da$diff.win, valdex2_da$diff.btw, pch=19, cex=0.3, col=rgb(0,0,0,0.3),
+     xlab="Dispersion", ylab="Difference")
+points(valdex2_da$diff.win[found.by.one], valdex2_da$diff.btw[found.by.one], pch=19,
+       cex=0.7, col=rgb(0,0,1,0.5))
+points(valdex2_da$diff.win[found.by.all], valdex2_da$diff.btw[found.by.all], pch=19,
+       cex=0.7, col=rgb(1,0,0,1))
+abline(0,1,lty=2)
+abline(0,-1,lty=2)
+
+```
+```{r}
+## Create a volcano plot where the significant OTUs are highlighted
+
+valdex2_da %>% 
+  rownames_to_column(var = "OTU") %>% 
+  left_join(vtaxa_info) %>% 
+  mutate(Significant=if_else(we.eBH<0.05, TRUE, FALSE)) %>% #Sort only significant (<0.05) OTUs
+  mutate(OTU=as.character(OTU)) %>% 
+  mutate(TaxonToPrint=if_else(we.eBH<0.05, OTU, "")) %>% # Sort only significant (<0.05) OTU
+  ggplot(aes(x=diff.btw, y=-log10(we.ep), color=Significant, label=TaxonToPrint)) +
+  geom_text_repel(size=1, nudge_y=0.05) +
+  geom_point(alpha=0.6, shape=16) +
+  xlab("log2(fold change)") +
+  ylab("-log10(P-value)") +
+  theme(legend.position="none") +
+  scale_color_manual(values=c("black","red"))
+
+ggsave("viral_volcano.pdf", height=3, width=3, device="pdf") #save file
+```
+Now let's try ANCOM-II, which can work straight with phyloseq data. We are setting the adjust method to BH so it is comparable to the output from ALDEx2
+
+```{r}
+vancom_da <- ancombc2(data = scr_vseq, fix_formula = "Farm", p_adj_method = 'BH', group = "Farm", pseudo = 1, struc_zero = TRUE, neg_lb = TRUE)
+```
+We need to inspect the output from ANCOM more:
+
+```{r}
+# Obtain the results table from ANCOM output
+vancom_res <- vancom_da$res
+vancom_res
+```
+
+Next, let's run DESeq2, a tool that was initially created for RNA-seq data, but that can be also used for DA studies on microbiome abundances.
+
+```{r deseq}
+# Convert to deseq object
+otu_table(scr_vseq) <- otu_table(scr_vseq) + 1 #Add pseudocount to avoid errors while running deseq
+vdeseq <- phyloseq_to_deseq2(scr_vseq, ~ Farm)
+
+# Run the test
+vdeseq_da <- DESeq(vdeseq, test="Wald")
+
+#Extract the results
+
+vdeseq_res <- as.data.frame(results(vdeseq_da, cooksCutoff = FALSE))
+vdeseq_res <- vdeseq_res %>% 
+  rownames_to_column(var = "OTU")
+vdeseq_res <- left_join(vdeseq_res, vtaxa_info) %>% 
+  arrange(padj)
+
+```
+
+Now, we need to organise the data by their log2FoldChange to select those OTUs that are DA. L2FC is the equivalent of effect size, and it should be applied as the second filter after using the adjusted p value for sorting the data
+
+```{r}
+vsig_deseq <- vdeseq_res %>% 
+  filter(padj < 0.05)
+```
+
+## COMPARISON OF METHODS
+
+First, compare the number of adjusted p-values under 0.05. This measure described the amoung of OTUs described as statistically relevant
+
+```{r}
+# Measure the p adj for all the oTUs and compare with the total
+
+print(paste0("ALDEx2 test p-values under 0.05: ", sum(valdex2_da$wi.eBH<0.05, na.rm = TRUE), "/", length(valdex2_da$wi.eBH)))
+print(paste0("ANCOM p-values under 0.05: ", sum(vancom_res$diff_FarmOuseburn), "/", length(vancom_res$diff_FarmOuseburn)))
+print(paste0("DESeq2 p-values under 0.05: ", sum(vdeseq_res$padj<0.05, na.rm = TRUE), "/", length(vdeseq_res$padj)))
+
+```
+
+Now we have to combine the results and create a measurement of how consistent the predictions are. We will retain OTUs that are found in at least 2 of the methods.
+
+```{r echo=FALSE}
+# Create a taxonomy table for each tool with significant taxa
+# For Deseq2
+
+vdeseq2_taxa <- filter(vdeseq_res, padj <= 0.05) %>% 
+  .$OTU
+vancom_taxa <- filter(vancom_res, diff_FarmOuseburn) %>% 
+  .$taxon
+valdex2_taxa <- filter(valdex2_da, we.eBH <= 0.05) %>% 
+  row.names(.)
+```
+
+```{r}
+vintersec_taxa <- Reduce(intersect, list(vdeseq2_taxa, vancom_taxa, valdex2_taxa))
+vintersec_taxa
+```
+
+Then intersection list approach is quite conservative (only 13 taxa), but might give very relevant results. It's also an important step because we already know that DESEq2 tends to give false positives, and we need to get rid of most of its output. Let's have a look at the most relevant taxa:
+
+```{r}
+vdiff_ab_taxa <- vdeseq_res[vdeseq_res$OTU %in% vintersec_taxa, c("Family","Order", "Genus")]
+```
+
+Let's try a less conservative approach for the selection of DA taxa. We'll compare the significant OTUs and count how many times they are detected by the tools, picking the OTUs that have been detected by at least 2 methods.
+
+```{r}
+# change genus names to otu ids for ancombc results to make it joinable with others
+vabc_res <- vancom_res %>% 
+  dplyr::select(taxon, ancombc = diff_FarmOuseburn)
+  
+# join all results together
+v_summ <- full_join(
+    rownames_to_column(valdex2_da, "taxon") %>%
+      dplyr::select(taxon, aldex2 = wi.eBH),
+    vabc_res,
+    by = "taxon") %>%
+  full_join(
+    dplyr::select(vdeseq_res, taxon = OTU, deseq2 = padj), 
+    by = "taxon") %>%
+  mutate(
+    across(c(aldex2, deseq2), ~ .x <= 0.05),
+    # the following line would be necessary without prevalence filtering 
+    # as some methods output NA
+    across(-taxon, function(x) ifelse(is.na(x), FALSE, x)),
+    ancombc = ifelse(is.na(ancombc), FALSE, ancombc),
+    score = rowSums(across(c(aldex2, ancombc, deseq2))),
+  )
+
+head(v_summ) #This gives all the viruses and the times they have been recognised by each program. Some have a 0 value on that column
+```
+
+```{r}
+summarise(v_summ, across(where(is.logical), sum))
+```
+```{r}
+#Filter by OTUs found in at least two of the methods
+
+vfinal_da_taxa <- filter(v_summ, score >= 2) %>% 
+  .$taxon
+
+```
+
+In this case, we obtain more than 170 taxa that are differential abundant. Now, we just need to know the taxonomic classification of those OTUs.
+
+```{r}
+vdiff_ab_taxa <- data.frame(tax_table(scr_vseq)[row.names(tax_table(scr_vseq)) %in% vfinal_da_taxa, c("Family","Order", "Genus")])
+```
+
+```{r}
+# Rename OTU columns
+valdex2_da <- valdex2_da %>% 
+  rownames_to_column(var = "OTU")
+vancom_res <-  vancom_res %>% 
+  dplyr::rename(., OTU = taxon)
+
+vda_res_list <- list(valdex2_da, vancom_res, vdeseq_res)
+
+# Do a full join of the dataframes
+
+vcombined_da_res <- vda_res_list %>% 
+  purrr::reduce(full_join, by="OTU") %>% 
+  dplyr::select(c(OTU, wi.eBH, diff_FarmOuseburn, padj))
+```
+
+```{r}
+# Set color for the points of the volcano plot
+
+# identify which values are significant in both the t-test and glm tests
+vfound.by.all <- which(vcombined_da_res$wi.eBH < 0.05 & vcombined_da_res$padj < 0.05 & vcombined_da_res$diff_FarmOuseburn == TRUE)
+
+# identify which values are significant in fewer than all tests
+vfound.by.two <- which((vcombined_da_res$wi.eBH < 0.05 & vcombined_da_res$padj < 0.05 | vcombined_da_res$diff_FarmOuseburn == TRUE) | (vcombined_da_res$wi.eBH < 0.05 | vcombined_da_res$padj < 0.05 & vcombined_da_res$diff_FarmOuseburn == TRUE))
+
+# identify values detected by at least 1 of the tools
+vfound.by.one <- which(vcombined_da_res$wi.eBH < 0.05 | vcombined_da_res$padj < 0.05 | vcombined_da_res$diff_FarmOuseburn == TRUE)
+
+# plot the within and between variation of the data
+#svg(filename = "da_comparison.svg")
+plot(valdex2_da$diff.win, valdex2_da$diff.btw, pch=19, cex=0.3, col=rgb(0,0,0,0.3),
+     xlab="Dispersion", ylab="Difference") +
+  points(valdex2_da$diff.win[vfound.by.one], valdex2_da$diff.btw[vfound.by.one], pch=19,
+       cex=0.7, col="#B3CDE3") +
+  points(valdex2_da$diff.win[vfound.by.two], valdex2_da$diff.btw[vfound.by.two], pch=19,
+       cex=0.7, col="pink") +
+  points(valdex2_da$diff.win[vfound.by.all], valdex2_da$diff.btw[vfound.by.all], pch=19,
+       cex=0.7, col="#F0027F") +
+  abline(0,1,lty=2) +
+  abline(0,-1,lty=2)
+```
+
+```{r}
+#Subset aldex results by selecting only the OTUs that were detected by all the tools
+# Rename the OTUs based on their taxonomy
+
+valdex_plot <- valdex2_da[vfound.by.two, ] %>% 
+  `row.names<-`(., NULL)
+
+vfinal_da_taxa <- valdex_plot$OTU
+
+vda_top_taxa <- data.frame(tax_table(scr_vseq)[row.names(tax_table(scr_vseq)) %in% vfinal_da_taxa, c("Genus")]) %>% 
+  tibble::rownames_to_column(., "OTU")
+
+valdex_plot <- left_join(valdex_plot, vda_top_taxa, by = "OTU") 
+valdex_plot$Genus[valdex_plot$Genus == "Unclassified"] <- valdex_plot$OTU
+
+viral_diff_plot <- valdex_plot %>% 
+  ggplot(aes(x=diff.btw, y=Genus, fill = diff.btw)) +
+  geom_col(position = "dodge") +
+  scale_fill_viridis_c(option = "turbo") +
+  labs(x="Betweenness", y="vOTU")
+viral_diff_plot
+```
+To better understand the graoh, we need to change the contig names form the DA analysis to the results from vContact2
+
+```{r}
+extra_taxa <- read.csv(file = "./da_taxonomy_virus.csv", header = TRUE)
+
+#Replace rows with Unassigned in the Genus column
+
+valdex_plot_new <- extra_taxa %>%
+  select(c(OTU, Genus, Host_Taxa)) %>% 
+  dplyr::rename("Genus_new" = "Genus") %>% 
+  left_join(., valdex_plot, by = "OTU")
+
+valdex_plot_new <- valdex_plot_new %>% 
+  mutate(Genus = ifelse(grepl("25*", Genus), Genus_new, Genus)) %>% 
+  mutate(Genus_uq = make.unique(as.character(Genus))) %>% 
+  mutate(Host_uq = make.unique(as.character(Host_Taxa)))
+
+viral_diff_plot <- valdex_plot_new %>% 
+  ggplot(aes(x=diff.btw, y=Host_uq, fill = diff.btw)) +
+  geom_col(position = "dodge") +
+  scale_fill_viridis_c(option = "turbo") +
+  labs(x="Betweenness", y="vOTU")
+viral_diff_plot
+```
+
+
+

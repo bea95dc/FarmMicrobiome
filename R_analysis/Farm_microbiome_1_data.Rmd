@@ -1,0 +1,463 @@
+---
+title: "Taxonomy analysis of WGS from air samples in farms"
+author: "Bea"
+date: "2022-11-08"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library("phyloseq")
+library("ggplot2")
+library("RColorBrewer")
+library("patchwork")
+library("microbiome")
+library("ape")
+library("vegan")
+#library("decontam")
+library("tidyverse")
+library('SCRuB')
+library("scater")
+library("ggpubr")
+setwd("/Users/beatrizdelgadocorrales/Desktop/PhD-BE_Microbiome/")
+```
+
+## CREATING PHYLOSEQ OBJECT AND SAMPLE CLEAN-UP
+
+
+```{r biom, echo = T, results='hide'}
+biom <- import_biom("farms.biom") #import biom
+class(biom)
+biom@tax_table@.Data <- substring(biom@tax_table@.Data, 4) #removes any character (p___) before the 4th
+colnames(biom@tax_table@.Data)<- c("Kingdom", "Phylum", "Class", "Order", "Family", "Genus", "Species") #name columns properly
+metadata <- read.table(file = 'farm_metadata.txt', sep = '\t', header = TRUE) #import metadata
+rownames(metadata) <- metadata$SampleID
+metadata$SampleID <- NULL
+metadata <- metadata %>% 
+  mutate(is.neg = if_else(is.na(Time) == TRUE, 'TRUE', 'FALSE'))
+#metadata['NuPos', "is.neg"] = FALSE
+pseq = merge_phyloseq(biom, sample_data(metadata))
+```
+Temporarily, I will remove the abndance data for Homo sapiens, as the only components we are interested in are the microorganisms in the samples. The correct final pipeline will include a decontamination step using Decontam in R, which will clean the samples for a final round of compositional analysis. 
+
+## USE DECONTAM TO CLEAN-UP SEQUENCES
+
+First, we will remove the 4 samples that were probably wrongly sequenced:
+
+```{r sample_remov}
+#to_remove <- c("66", "67", "VKB", "SWABb")
+to_remove <- c("VKB", "SWABb")
+pseq <- prune_samples(!(sample_names(pseq) %in% to_remove), pseq)
+```
+
+Now we are going to select the samples that are blanks and re-calculate the species abundance taking those into account.
+
+```{r decontam, echo=FALSE}
+sample_data(pseq)$is.neg <- sample_data(pseq)$is.neg == "TRUE" # Transform into a character argument
+no_pos.pseq <- prune_samples(!(sample_names(pseq) == 'NuPos'), pseq)
+contamdf.prev <- isContaminant(no_pos.pseq, method="prevalence", neg="is.neg", threshold=0.5)
+table(contamdf.prev$contaminant)
+contam_outs <- tax_table(pseq)[contamdf.prev$contaminant,] #obtaining OTUs detected as contaminants from the phyloseq object
+write.csv(contam_outs, file = "contam_species.csv", row.names = FALSE, col.names = TRUE, sep = ",")
+pseq.contam <- prune_taxa(contamdf.prev$contaminant, pseq)
+pseq.filt <- prune_taxa(contamdf.prev$contaminant == FALSE, pseq) 
+```
+After removing the positive control as one of the is.neg=TRUE factors, decontam CANT FIND contaminants. 
+
+Clean-up any rest of Human taxa
+
+```{r cleanup, include=FALSE}
+unique(pseq@tax_table@.Data[,"Kingdom"]) #explore number of unique taxa
+sum(pseq@tax_table@.Data[,"Species"] == "Homo sapiens")
+badTaxa = c("9606") #ID of Homo Sapiens in the data table
+allTaxa = taxa_names(pseq.filt)
+pseq.human <- allTaxa[!(allTaxa %in% badTaxa)]
+pseq.filt = prune_taxa(pseq.human, pseq.filt)
+```
+
+Now, let's prune the blanks from the dataset to calculate better the beta-diversity and other measures
+
+```{r prune_blanks, echo =FALSE}
+to_remove <- c("NuNeg", "NuPos", "PBSb", "SKB")
+pseq.filt <- prune_samples(!(sample_names(pseq.filt) %in% to_remove), pseq.filt)
+```
+
+## USE SCRUB TO REMOVE CONTAMINANTS
+
+We'll use the same phyloseq object created in the previous chunks (pseq) before use of Decontam
+
+```{r scrub_clean}
+
+# Create a filtered metadata for SCRUB
+
+scrub_meta <- data.frame(sample_data(pseq)) %>% 
+  dplyr::select(is.neg, Farm) %>% 
+  dplyr::rename(is_control = is.neg, sample_type = Farm)
+scrub_meta['66', "is_control"] = TRUE
+scrub_meta['67', "is_control"] = TRUE
+scrub_meta['66', "sample_type"] = "Blank1"
+scrub_meta['67', "sample_type"] = "Blank2"
+
+# Create the OTU matrix, which needs to have samples as rows and needs to match with the rows in the metadata
+
+scrub_otu <- t(data.frame(otu_table(pseq), check.names = FALSE)) %>% 
+  as.matrix()
+  
+# Run SCRuB
+
+scr_out <- SCRuB(scrub_otu, scrub_meta, control_order = c("Buffer", "Blank1", "Blank2", "Soil_Kit", "Sequencing"))
+
+```
+
+```{r scrub_out}
+scr_out$p %>% 
+  boxplot()
+```
+
+```{r}
+decontaminated_samples <- data.frame(scr_out$decontaminated_samples, check.names = FALSE)
+decontaminated_samples[1:10, 25:40]
+```
+
+```{r}
+scr_out$inner_iterations$`Blank2`$gamma %>% 
+  plot()
+```
+After the decontamination step using SCRuB, a new phyloseq object needs to be created to run the analyses. Some metric will be obtained to compare the two decontamination methods and an abundance plot will be generated for both to compare how the contamination was affecting the overall results. 
+
+```{r pseq_scrub}
+# Create phyloseq object with the scrub results
+
+scrub_tax <- data.frame(tax_table(pseq), check.names = FALSE)
+
+length(row.names(t(decontaminated_samples))) # Check length of OTU table from SCRUB
+length(row.names(scrub_tax)) # Check length of Tax table from original data
+
+# Remove blanks from sample metadata before merging
+
+decon_meta <- data.frame(sample_data(pseq)) %>% 
+  dplyr::filter(is.neg == FALSE)
+
+# Create different parts of phyloseq object
+
+OTU <- phyloseq::otu_table(t(data.frame(decontaminated_samples, check.names = FALSE)), taxa_are_rows = TRUE)
+TAX <- phyloseq::tax_table(as.matrix(scrub_tax))
+META <- phyloseq::sample_data(decon_meta)
+
+scr_pseq <- phyloseq(OTU, TAX, META)
+
+## Clean scrub object from human, viral and non-assigned reads
+
+sum(scr_pseq@tax_table@.Data[,"Species"] == "sapiens") # There is none
+bad_taxa <- as.character(which(scr_pseq@tax_table@.Data[,"Kingdom"] == "Viruses" | scr_pseq@tax_table@.Data[,"Kingdom"] == ""))
+#badTaxa = c("9606") #ID of Homo Sapiens in the data table
+allTaxa = taxa_names(scr_pseq)
+#pseq.goodtaxa <- allTaxa[!(allTaxa %in% bad_taxa)]
+#scr_pseq = prune_taxa(pseq.goodtaxa, scr_pseq)
+scr_pseq <- subset_taxa(scr_pseq, Kingdom!='Viruses')
+scr_pseq <- subset_taxa(scr_pseq, Kingdom!="")
+scr_pseq <- subset_taxa(scr_pseq, Species!="sapiens")
+```
+
+Now create a comparison plot for the taxa abundance for each decontamination method
+```{r decontam_plot}
+phyloseq::plot_bar(pseq.filt, fill="Phylum", x='SampleName') +
+  guides(fill=guide_legend(ncol=2))
+```
+
+```{r scru_plot}
+phyloseq::plot_bar(scr_pseq, fill = 'Phylum', x="SampleName") +
+  guides(fill=guide_legend(ncol=2))
+```
+
+
+## CALCULATE CORE MICROBIOME
+
+Microbiome data is compositional, so the sequencing data needs to be transformed to abundances instead of number of sequences. Moreover, the high diversity detected by this method makes plotting really complicated and meaningless if all the diversity is taken into account. Calculating the core microbiome will be helpful to make some of the calculations and plots. In this case, I set the threshold for the core microbiome to OTUs that appear in at least half of the samples.
+
+It is important to calculate the relative abundances once the samples have been cleaned-up from non-microbial taxa and from microbial contaminants in the blanks. The same goes for calculating the core microbiome.
+
+## PLOT ALPHA AND BETA DIVERSITY
+
+```{r plot_richness, fig.asp = 0.5, fig.width = 12}
+rich_m <- plot_richness(physeq = scr_pseq, measures = c("Observed", "Shannon"), color = "Farm", x = "Farm") +
+  geom_boxplot(outlier.shape = NA) +
+  scale_color_viridis_d(option = "plasma")
+rich_m$layers[1] <- NULL
+rich_m2 <- plot_richness(physeq = scr_pseq, measures = c("Observed","Shannon"), color = "RoomType", x = "Farm") +
+  geom_boxplot(outlier.shape = NA) +
+  scale_colour_viridis_d(option = "plasma")
+rich_m2$layers[1] <- NULL
+
+#Plot richness by kingdom
+
+b_pseq <- subset_taxa(scr_pseq, Kingdom == "Bacteria")
+f_pseq <- subset_taxa(scr_pseq, Kingdom == "Eukaryota")
+a_pseq <- subset_taxa(scr_pseq, Kingdom == "Archaea")
+
+rich_b <- plot_richness(physeq = b_pseq, measures = c("Observed", "Shannon"), color = "RoomType", x = "Farm") +
+  geom_boxplot() +
+  scale_colour_viridis_d(option = "mako")
+rich_b$layers[1] <- NULL
+rich_f <- plot_richness(physeq = f_pseq, measures = c("Observed", "Shannon"), color = "RoomType", x = "Farm") +
+  geom_boxplot() +
+  scale_colour_viridis_d(option = "inferno")
+rich_f$layers[1] <- NULL
+rich_a <- plot_richness(physeq = a_pseq, measures = c("Observed", "Shannon"), color = "RoomType", x = "Farm") +
+  geom_boxplot() +
+  scale_colour_viridis_d(option = "viridis")
+rich_a$layers[1] <- NULL
+```
+
+```{r}
+#Create multiplot of alpha diversity
+ggarrange(ggarrange(rich_m, rich_m2, labels = c("Microbiome", "Microbiome"), ncol = 2),  
+          ggarrange(rich_b, rich_f, rich_a, labels = c("Bac", "Euk", "Arc"), ncol = 3), 
+          nrow = 2)
+
+```
+
+```{r plot_prevalence, echo = TRUE, fig.asp = 0.5, fig.width = 10}
+# This chunk is not relevant for now, we would need to produce the df_phylum data frame
+heatmap <- df_phylum %>% 
+  ggplot(data = ., aes(x=SampleName, y=Phylum)) +
+  geom_tile(aes(fill=Abundance))
+
+barchart <- df_phylum %>% 
+  ggplot(data = ., aes(x=Sample, y=Abundance, fill=Phylum)) +
+  geom_bar(stat = "identity", colour = "black") +
+  scale_fill_brewer(palette = "Blues") #not enough colours
+```
+
+```{r ordination, echo = T, results = 'hide'}
+#meta_ord <- ordinate(physeq = pseq.rel, method = "PCoA", distance = "unifrac") #will display warning about low number of samples
+ps_clr <- microbiome::transform(scr_pseq, "clr") #calculate centered-log ratio
+ord_clr <- phyloseq::ordinate(ps_clr, "PCoA", distance = "euclidean")
+phyloseq::plot_scree(ord_clr) + 
+  geom_bar(stat="identity", fill = "blue") +
+  labs(x = "\nAxis", y = "Proportion of Variance\n")
+```
+
+```{r}
+clr1 <- ord_clr$CA$eig[1] / sum(ord_clr$CA$eig)
+clr2 <- ord_clr$CA$eig[2] / sum(ord_clr$CA$eig)
+phyloseq::plot_ordination(scr_pseq, ord_clr, type="samples", color="RoomType", label = "Room") + 
+  geom_point(size = 2) +
+  #coord_fixed(clr2 / clr1) +
+  stat_ellipse(aes(group = RoomType), linetype = 2)
+phyloseq::plot_ordination(scr_pseq, ord_clr, type="samples", color="Farm", label = "Room") + 
+  geom_point(size = 2) +
+  #coord_fixed(clr2 / clr1) +
+  stat_ellipse(aes(group = Farm), linetype = 2)
+phyloseq::plot_ordination(scr_pseq, ord_clr, type="samples", color="Season") + 
+  geom_point(size = 1) +
+  #coord_fixed(clr2 / clr1) +
+  stat_ellipse(aes(group = Season), linetype = 2) +
+  geom_text(mapping = aes(label = Room), size = 4, vjust = 1.5) +
+  theme_bw()
+```
+
+
+```{r}
+#Generate distance matrix
+clr_dist_matrix <- phyloseq::distance(ps_clr, method = "euclidean")
+
+#ADONIS test is done in the other Rmarkdown
+#vegan::adonis2(clr_dist_matrix ~ phyloseq::sample_data(ps_clr)$RoomType, perm=999, method = "euclidean")
+
+dispr_room <- vegan::betadisper(clr_dist_matrix, phyloseq::sample_data(ps_clr)$RoomType)
+dispr_farm <- vegan::betadisper(clr_dist_matrix, phyloseq::sample_data(ps_clr)$Farm)
+dispr_season <- vegan::betadisper(clr_dist_matrix, phyloseq::sample_data(ps_clr)$Season)
+pl_room <- plot(dispr_room, main = "Ordination Centroids and Dispersion Labeled: Aitchison Distance", sub = "", hull = FALSE, ellipse = TRUE)
+pl_farm <- plot(dispr_farm, main = "Ordination Centroids and Dispersion Labeled: Aitchison Distance", sub = "", hull = FALSE, ellipse = TRUE)
+pl_season <- plot(dispr_season, main = "Ordination Centroids and Dispersion Labeled: Aitchison Distance", sub = "", hull = FALSE, ellipse = TRUE)
+boxplot(dispr_room, main = "", xlab = "")
+boxplot(dispr_farm, main = "", xlab = "")
+boxplot(dispr_season, main = "", xlab = "")
+```
+
+Here we create a combined plot with the Centered distances
+
+```{r}
+par(mfrow = c(1,3))
+
+plot(dispr_farm, main = "Microbiome Dispersion: Farm", sub = "", hull = FALSE, ellipse = TRUE)
+plot(dispr_room, main = "Microbiome Dispersion: Room", sub = "", hull = FALSE, ellipse = TRUE)
+plot(dispr_season, main = "Microbiome Dispersion: Season", sub = "", hull = FALSE, ellipse = TRUE)
+
+par(mfrow = c(1,1))
+```
+
+After transforming the microbiome data into compositional data and calculating the ordinates, we can plot the PCoA and observe any clusters based on the metadata associated with the samples. The first graph shows two clusters: one is composed of the office and closed rooms in the farms with main human presence and no animals, and the second cluster shows samples from the animal dwellings, both open or closed to the outdoor air. This potentially shows that animal microbiomes are key contributors to the air microbiome diversity, as well as external microbiomes due to the more open connection of these rooms to the outdoor air. 
+
+```{r plot_ord1, fig.asp = 0.5, fig.width = 10}
+plot_ordination(scr_pseq, ordination = ord_clr, color="RoomType", label = "SampleName", 
+    title=paste0("PCoA plot based on Bray-Crutis distances")) + 
+    theme(legend.position="bottom")
+```
+
+```{r plot_ord2, fig.asp = 0.5, fig.width = 10}
+plot_ordination(scr_pseq, ordination = ord_clr, color="Farm", label = "SampleName", 
+    title=paste0("PCoA plot based on Bray-Crutis distances")) + 
+    theme(legend.position="bottom")
+```
+
+## COMPOSITIONAL ANALYSIS USING THE CORE MICROBIOME (TOP 50 OTUS)
+
+```{r topOTU, echo = T, results = 'hide'}
+#pseqTSSz <- microbiome::transform(top50OTU, "Z")
+top50OTU.names = names(sort(taxa_sums(pseq.core), TRUE)[1:50])
+top50OTU = prune_taxa(top50OTU.names, pseq.core) 
+```
+
+```{r plot_heatmap, fig.asp = 0.7, fig.width = 10}
+#plot_bar(top50OTU, x="Id", fill="Species")
+plot_heatmap(top50OTU, method=NULL, taxa.label=c("Genus", "Species"), sample.label = "SampleName", sample.order = "SampleName", taxa.order = "Genus", low="#000033", high="#CCFF66")
+```
+
+### RELATIVE ABUNDANCE PLOTTING FOR CORE MICROBIOME
+
+We will create a function to plot the core microbiome by any taxonomic rank easily from a phylose object.
+
+```{r plot_funct}
+## Create function to agglomerate taxa by rank, melt into df and plot using geom_bar()
+
+abundance_plot <- function(phylo, taxrank) {
+  # Transform phyloseq object
+  ps.glom <- tax_glom(phylo, taxrank = taxrank) #group abundances by rank
+  ps.rel <- microbiome::transform(ps.glom, "compositional")
+  ps.core <- core(ps.rel, detection = 1/1000, prevalence = 75/100)
+  df.esp <- psmelt(ps.core) #transform phyloseq object into a df
+  # Create custom color palette
+  df.esp[[taxrank]] <- as.factor(df.esp[[taxrank]])
+  df.color <- colorRampPalette(brewer.pal(8,"Dark2")) (length(levels(df.esp[[taxrank]])))
+  # Make bar chart using ggplot
+  tax.plot <- ggplot(data=df.esp, aes(x=SampleName, y=Abundance, fill=df.esp[[taxrank]])) + 
+    geom_bar(aes(), stat="identity", position="stack") +
+    scale_fill_manual(values = df.color) +
+    scale_x_discrete(guide = guide_axis(angle = 45)) +
+    #facet_wrap(~Farm+Room, scales = "free_y") +
+    facet_grid(~Farm + Room, scales = "free_x", space = "free_x") +
+    theme(strip.text.x = element_text(size=10)) +
+    guides(fill=guide_legend(title = "Taxa"))
+  # Return plot
+  return(tax.plot)
+}
+```
+
+Now, plot:
+
+```{r plot_bar, fig.asp = 0.7, fig.width = 10}
+
+#pseq.core <- core(scr_pseq, detection = 0, prevalence = 50/100) #at least 0.01% in at least 50% of samples
+pseq.genus <- tax_glom(scr_pseq, taxrank = "Genus")
+pseq.rel <- microbiome::transform(scr_pseq, "compositional")
+pseq.core <- core(pseq.rel, detection = 1/1000, prevalence = 25/100) #at least 0.01% in at least 50% of samples
+
+abundance_plot(pseq.rel, "Kingdom")
+abundance_plot(pseq.rel, "Phylum")
+abundance_plot(pseq.rel, "Genus")
+```
+
+Let's plot the core microbiome calculated by farm (not as a whole like before)
+
+```{r farm_core}
+pseq.genus.naff <- subset_samples(pseq.genus, Farm=="Nafferton")
+pseq.genus.ous <- subset_samples(pseq.genus, Farm=='Ouseburn')
+rel.naff <- microbiome::transform(pseq.genus.naff, "compositional")
+rel.ous <- microbiome::transform(pseq.genus.naff, "compositional")
+```
+
+```{r}
+abundance_plot(pseq.genus.naff, "Genus")
+abundance_plot(pseq.genus.ous, "Genus")
+```
+
+
+## ANALYSIS OF DIVERSITY BY KINGDOM
+
+```{r pseq_subset, echo = T, results = 'hide'}
+b_pseq <- subset_taxa(scr_pseq, Kingdom == "Bacteria")
+f_pseq <- subset_taxa(scr_pseq, Kingdom == "Eukaryota")
+a_pseq <- subset_taxa(scr_pseq, Kingdom == "Archaea")
+```
+
+*Statistical analysis by kingdom*
+
+We are now creating a function to calculate all PERMANOVA studies based on metadata factors by kingdom. This way we save time and space in the script 
+
+```{r PERM_fun}
+perm_fun <- function(physeq, method){
+  clr <- microbiome::transform(physeq, "clr") #convert reads to CLR
+  dist_mat <- phyloseq::distance(clr, method = method) # calculate distance matrix
+  permanova <- vegan::adonis2(dist_mat~phyloseq::sample_data(clr)$Farm+phyloseq::sample_data(clr)$RoomType+phyloseq::sample_data(clr)$Season, perm=999, by="terms")
+  return(permanova)
+}
+#method = method
+```
+
+Now try the function with the different kingdoms
+
+```{r}
+perm_fun(b_pseq, "euclidean")
+```
+```{r}
+perm_fun(a_pseq, "euclidean")
+```
+
+```{r}
+perm_fun(f_pseq, "euclidean")
+```
+We're creating a function to calculate the beta-dispr on each of the distance matrices to plot and compare to the PERMANOVA results. This way we double check the results, as the PERMANOVA analyses might lead to false positives in microbiome data.
+
+```{r dispr_funct}
+
+dispr_fun <- function(physeq, method, kingdom){
+  clr <- microbiome::transform(physeq, "clr")
+  dist_mat <- phyloseq::distance(clr, method = method) # calculate distance matrix
+  room <- vegan::betadisper(dist_mat, phyloseq::sample_data(physeq)$RoomType)
+  farm <- vegan::betadisper(dist_mat, phyloseq::sample_data(physeq)$Farm)
+  season <- vegan::betadisper(dist_mat, phyloseq::sample_data(physeq)$Season)
+  p_farm <- plot(farm, main = paste(kingdom, "Dispersion: Farm"), sub = "", hull = FALSE, ellipse = TRUE)
+  p_room <- plot(room, main = paste(kingdom, "Dispersion: Room"), sub = "", hull = FALSE, ellipse = TRUE)
+  p_season <- plot(season, main = paste(kingdom, "Dispersion: Season"), sub = "", hull = FALSE, ellipse = TRUE)
+  plist <- list(p_room, p_farm, p_season)
+  return(plist)
+}
+```
+
+
+```{r}
+# Calculate all distance matrices by kingdom and plot them in reference to metadata groups
+# For bacteria
+jpeg("dist_bact_new.jpeg", width = 800, height = 500)
+  par(mfrow = c(1,3))
+  dispr_fun(b_pseq, "euclidean", "Bacteria")
+  par(mfrow = c(1,1))
+#dev.off()
+
+#For eukaryotes
+jpeg("dist_euk_new.jpeg", width = 800, height = 500)
+  par(mfrow = c(1,3))
+  dispr_fun(f_pseq, "euclidean", "Eukarya")
+  par(mfrow = c(1,1))
+dev.off()
+  
+#For archaea
+jpeg("dist_arch_new.jpeg", width = 800, height = 500)
+  par(mfrow = c(1,3))
+  dispr_fun(a_pseq, "euclidean", "Archaea")
+  par(mfrow = c(1,1))
+dev.off()
+```
+
+*Fungal composition analysis*
+
+Let's investigate why the fungal composition is more clearly separated by type of room
+
+```{r f_calculations, echo = T, results = 'hide'}
+#f_pseq.core <- core(f_pseq, detection = 0, prevalence = 25/100)
+a_pseq.rel <- microbiome::transform(a_pseq, "compositional")
+abundance_plot(a_pseq.rel, "Class")
+```
+
